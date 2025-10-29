@@ -1,0 +1,160 @@
+## Top-level
+
+| Key                      | Type  | Valid Values                                                                                                      | Default | Used by           | What it does / Notes                                           |
+| ------------------------ | ----- | ----------------------------------------------------------------------------------------------------------------- | ------- | ----------------- | -------------------------------------------------------------- |
+| `device`                 | str   | `auto` | `cpu` | `cuda`                                                                                           | `auto`  | loaders, trainers | Chooses compute device. `auto` picks CUDA if available.        |
+| `seed`                   | int   | any ≥0                                                                                                            | 0       | setup             | Global RNG seed (PyTorch/NumPy/Python).                        |
+| `dataset`                | str   | `MNIST` | `FashionMNIST` | `CIFAR10`                                                                              | —       | data              | Selects dataset + input normalization.                         |
+| `model`                  | str   | `SeedCNN` | `LeNet5Seed` | `SmallMNISTCNN` | `LeNet5Tanh` | `LeNet5ELU` | `ResNet8` | `ResNet16` | `MojoCIFARCNN` | —       | model builder     | Chooses architecture; sets input channels (e.g., CIFAR10→3ch). |
+| `destination_activation` | str   | `relu` | `tanh` | `elu`                                                                                           | `relu`  | ANG grower        | Activation for grown head(s).                                  |
+| `elu_alpha`              | float | >0                                                                                                                | 1.0     | ANG grower        | ELU slope if `destination_activation: elu`.                    |
+
+---
+
+## Data & Training
+
+| Key                | Type  | Valid Values | Default              | Used by              | What it does / Notes                    |
+| ------------------ | ----- | ------------ | -------------------- | -------------------- | --------------------------------------- |
+| `data.batch_size`  | int   | ≥1           | 128/512 (your files) | loaders              | Per-step batch size.                    |
+| `data.num_workers` | int   | ≥0           | auto-capped          | loaders              | DataLoader workers. Windows coerced ≤2. |
+| `data.pin_memory`  | bool  | true/false   | true                 | loaders              | Pins host memory for faster H→D.        |
+| `data.val_split`   | float | 0–1          | 0.0                  | your driver          | Optional split off train.               |
+| `train.epochs`     | int   | ≥1           | 5                    | trainer (where used) | Epochs for any auxiliary train.         |
+| `train.lr`         | float | >0           | 1e-3                 | trainer (where used) | Learning rate.                          |
+
+---
+
+## I/O & Logging
+
+| Key                           | Type     | Valid Values | Default                      | Used by      | What it does / Notes                  |
+| ----------------------------- | -------- | ------------ | ---------------------------- | ------------ | ------------------------------------- |
+| `io.models_dir`               | str      | path         | `models`                     | save/load    | Directory for weights.                |
+| `io.results_dir`              | str      | path         | `results`                    | ANG/driver   | ANG outputs/checkpoints.              |
+| `io.profiling_dir`            | str      | path         | `profiling`                  | SIC profiler | Stores stats/reports.                 |
+| `io.custom_load_path`         | str|null | file path    | null                         | ANG/SIC      | If set, load weights from here.       |
+| `io.custom_save_name`         | str|null | filename     | null                         | ANG/SIC      | Suggested output name.                |
+| `io.neuron_log_path`          | str      | file         | `SIC_per_neuron_times.jsonl` | SIC          | Per-neuron timing log.                |
+| `io.log_flush_every`          | int      | ≥1           | 1000                         | SIC          | Flush cadence for JSONL log buffer.   |
+| `io.enable_neuron_log`        | bool     | —            | true                         | SIC          | Toggle per‑neuron logging.            |
+| `io.enable_autosave_progress` | bool     | —            | true                         | SIC          | Allow autosaving detailed stats JSON. |
+| `io.autosave_progress_path`   | str      | file         | `SIC_Progress_Autosave.json` | SIC          | Path for progress JSON.               |
+| `io.excel_path`               | str|null | file         | null                         | external     | Placeholder, safe if null.            |
+| `io.json_stats_path`          | str|null | file         | null                         | external     | Placeholder, safe if null.            |
+
+---
+
+## ANG (Adaptive Neuron Growth)
+
+| Key                             | Type     | Valid Values     | Default   | What it does                                 |
+| ------------------------------- | -------- | ---------------- | --------- | -------------------------------------------- |
+| `ang.src_layer`                 | str      | dotted name      | —         | Feature tap in seed model used to grow from. |
+| `ang.prime_epochs`              | int      | ≥0               | 11/1      | Priming epochs before growth cycles.         |
+| `ang.grow_max_epochs`           | int      | ≥1               | 50/2      | Max epochs per grow cycle.                   |
+| `ang.cycles`                    | int      | ≥1               | 18/1      | Number of growth cycles.                     |
+| `ang.target_acc`                | float    | 0–1              | 0.98/0.99 | Global accuracy target per cycle.            |
+| `ang.per_class_target`          | float    | 0–1              | 0.98/0.99 | Per-class accuracy target per cycle.         |
+| `ang.scale`                     | float    | >0               | 1.0       | Multiplier for growth size/strength.         |
+| `ang.max_classes_per_cycle`     | int|null | ≥1               | null      | Limits classes processed per cycle.          |
+| `ang.freeze_seed_after_priming` | bool     | —                | false     | Freeze seed backbone after priming.          |
+| `ang.es_patience`               | int      | ≥0               | 20        | Early stopping patience (epochs).            |
+| `ang.es_target_val_acc`         | float    | 0–1              | 1.0       | Stop early when this val acc reached.        |
+| `ang.grow_representation`       | str      | `sparse`|`dense` | `sparse`  | Hint to builder; safe no‑op if unsupported.  |
+
+---
+
+## SIC (Synaptic Input Consolidation)
+
+### Execution & Flow
+
+| Key             | Type | Values             | Default  | What it does                                   |
+| --------------- | ---- | ------------------ | -------- | ---------------------------------------------- |
+| `sic.mode`      | str  | `hybrid`|`classic` | `hybrid` | Hybrid uses GPU fast path for big rows/layers. |
+| `sic.visualize` | bool | —                  | false    | Reserved toggle for visual tools.              |
+
+### Clustering & Pass Control
+
+| Key                          | Type | Values | Default   | Notes                                              |
+| ---------------------------- | ---- | ------ | --------- | -------------------------------------------------- |
+| `sic.rounding_decimals`      | int  | 0–12   | 6         | Quantizes for grouping; higher keeps more uniques. |
+| `sic.max_passes`             | int  | ≥1     | 3         | Upper bound on SIC passes.                         |
+| `sic.repeat_until_no_change` | bool | —      | true      | Stop early when fingerprint unchanged.             |
+| `sic.max_k_per_neuron`       | int  | ≥1     | 1_000_000 | Hard cap on groups per neuron/row.                 |
+| `sic.neuron_patience`        | int  | ≥0     | 0         | Freeze a neuron after N failed convergence tries.  |
+
+### Acceptance Set (ASC) & Tiered Checks
+
+| Key                     | Type     | Values                    | Default     | Notes                               |
+| ----------------------- | -------- | ------------------------- | ----------- | ----------------------------------- |
+| `sic.acceptance_from`   | str      | `train`|`val`|`train+val` | `train+val` | Source for exactness set.           |
+| `sic.eval_max`          | int|null | ≥1                        | null        | Cap ASC size (null = all).          |
+| `sic.tiered_asc.enable` | bool     | —                         | false       | Progressive gate: fast→medium→full. |
+| `sic.tiered_asc.fast`   | int      | ≥1                        | 256/512     | First quick check size.             |
+| `sic.tiered_asc.medium` | int      | ≥1                        | 1024        | Second check size.                  |
+
+### Hybrid / GPU Gates
+
+| Key                              | Type | Values | Default   | Notes                                 |
+| -------------------------------- | ---- | ------ | --------- | ------------------------------------- |
+| `sic.hybrid_enable`              | bool | —      | true      | Enable hybrid GPU path.               |
+| `sic.row_len_gpu_threshold`      | int  | ≥1     | 2048      | Row length to switch to GPU.          |
+| `sic.layer_params_gpu_threshold` | int  | ≥1     | 1_000_000 | Per-layer param threshold for GPU.    |
+| `sic.gpu_row_len_min`            | int  | ≥1     | 2048      | Low-level guard (internal fast path). |
+
+### Post-Cluster Merging & Progress
+
+| Key                           | Type      | Values         | Default | Notes                                        |
+| ----------------------------- | --------- | -------------- | ------- | -------------------------------------------- |
+| `sic.merge_after_clustering`  | bool      | —              | false   | Average weights within equal groups.         |
+| `sic.progress`                | bool      | —              | true    | Print progress lines.                        |
+| `sic.debug_skip`              | bool      | —              | false   | Verbose skips for modules.                   |
+| `sic.exclude_modules_by_name` | list[str] | names/suffixes | []      | Skip exact or suffix matches (e.g., `.bn1`). |
+
+### Compilation & Autosave
+
+| Key                            | Type | Values | Default | Notes                                      |
+| ------------------------------ | ---- | ------ | ------- | ------------------------------------------ |
+| `sic.compile_model`            | bool | —      | false   | Attempt `torch.compile(model)` before SIC. |
+| `sic.autosave_json_each_layer` | bool | —      | true    | Persist profiler JSON after each layer.    |
+
+### Early-Stop Heuristics
+
+| Key                         | Type  | Values | Default | Notes                                |    |              |
+| --------------------------- | ----- | ------ | ------- | ------------------------------------ | -- | ------------ |
+| `sic.uwc_patience`          | int   | ≥0     | 1       | Wait this many stale UWC passes.     |    |              |
+| `sic.uwc_min_rel_delta`     | float | ≥0     | 0.0     | Min rel drop in unique-weight-count. |    |              |
+| `sic.uwc_exclude_zero`      | bool  | —      | true    | Ignore zeros in UWC stats.           |    |              |
+| `sic.min_pass_weight_delta` | float | ≥0     | 0.0     | Stop pass if max                     | ΔW | < threshold. |
+
+### PoS Materialization & Acceleration
+
+| Key                          | Type | Values | Default | Notes                                                   |
+| ---------------------------- | ---- | ------ | ------- | ------------------------------------------------------- |
+| `sic.enable_product_of_sums` | bool | —      | false   | Replace Linear/Conv with **SICLinear/SICConv2d** first. |
+| `sic.fast_pos_accel`         | bool | —      | true    | Convert PoS→fused FastPoS layers.                       |
+| `sic.fast_pos_compile`       | bool | —      | true    | Attempt `torch.compile` on FastPoS.                     |
+
+---
+
+## Pruning (Accuracy-Preserving on ASC)
+
+| Key                      | Type     | Values                                                                        | Default                 | Notes                                      |
+| ------------------------ | -------- | ----------------------------------------------------------------------------- | ----------------------- | ------------------------------------------ |
+| `prune.enabled`          | bool     | —                                                                             | false                   | Toggle pruning step.                       |
+| `prune.strategy`         | str      | `per_neuron_sequential` | `per_layer_binary_search` | `per_neuron_binary_pos` | `per_neuron_sequential` | Choose algorithm (PoS‑aware when `*_pos`). |
+| `prune.include_bias`     | bool     | —                                                                             | false                   | Allow bias zeros.                          |
+| `prune.acceptance_from`  | str      | train/val/train+val                                                           | train+val               | Build ASC for pruning.                     |
+| `prune.acceptance_max`   | int|null | ≥1                                                                            | null                    | Cap ASC size.                              |
+| `prune.check_batch_size` | int      | ≥1                                                                            | 1024                    | Eval batch for binary searches.            |
+
+---
+
+## Verify (Reporting)
+
+| Key                          | Type | Values | Default | Notes                                   |
+| ---------------------------- | ---- | ------ | ------- | --------------------------------------- |
+| `verify.rounding_decimals`   | int  | 0–12   | 6       | Controls grouping for uniqueness stats. |
+| `verify.force_hook_hw`       | bool | —      | false   | Force hook to obtain H×W.               |
+| `verify.print_conv_shapes`   | bool | —      | false   | Echo conv shapes in report.             |
+| `verify.print_linear_shapes` | bool | —      | false   | Echo linear shapes in report.           |
+| `verify.print_table`         | bool | —      | false   | Print weights summary table.            |
+| `verify.verbose`             | bool | —      | true    | Detailed console output.                |

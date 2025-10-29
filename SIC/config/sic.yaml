@@ -1,0 +1,105 @@
+# =========================
+# Top-level
+# =========================
+device: auto
+dataset: MNIST
+model: LeNet5Tanh
+
+# =========================
+# Data & Training
+# =========================
+data:
+  batch_size: 512
+  num_workers: 1
+  pin_memory: true
+  val_split: 0.15
+
+# =========================
+# I/O & Logging
+# =========================
+io:
+  models_dir: saved_models
+  profiling_dir: profiling
+  neuron_log_path: SIC_per_neuron_times.jsonl
+  log_flush_every: 10000
+  enable_neuron_log: false
+  enable_autosave_progress: false
+  autosave_progress_path: SIC_Progress_Autosave.json
+  excel_path: null
+  json_stats_path: null
+  custom_load_path: null
+  custom_save_name: null
+
+# =========================
+# SIC (clustering / PoS)
+# =========================
+sic:
+  # Execution mode
+  mode: hybrid
+  visualize: false
+
+  # Clustering & passes
+  rounding_decimals: 32
+  max_passes: 1
+  repeat_until_no_change: true
+  max_k_per_neuron: 1000000
+  neuron_patience: 2
+
+  # Acceptance subset (ASC) controls
+  acceptance_from: "train+val"
+  eval_max: 100
+  tiered_asc:
+    enable: true
+    fast: 1024
+    medium: 2048
+
+  # Hybrid/GPU gates
+  hybrid_enable: true
+  row_len_gpu_threshold: 2048
+  layer_params_gpu_threshold: 10000
+  gpu_row_len_min: 2048
+
+  # Merging (post-cluster averaging of equal groups)
+  merge_after_clustering: true
+
+  # Progress & debug
+  progress: true
+  debug_skip: false
+  exclude_modules_by_name: [] # (["classifier", ".bn1"])
+
+  # Global model compile (optional)
+  compile_model: false
+  autosave_json_each_layer: true
+
+  # Unique-weight-count (UWC) based early stopping
+  uwc_patience: 1
+  uwc_min_rel_delta: 0.0
+  uwc_exclude_zero: true
+  min_pass_weight_delta: 0.0
+
+  # PoS materialization & acceleration
+  enable_product_of_sums: true  
+  fast_pos_accel: true           
+  fast_pos_compile: true
+
+# =========================
+# Pruning (keeps ASC exact)
+# =========================
+prune:
+  enabled: true
+  strategy: per_neuron_sequential
+  include_bias: false
+  acceptance_from: "train+val"
+  acceptance_max: null
+  check_batch_size: 1024
+
+# =========================
+# Verify convenience block (used by your scripts/tools)
+# =========================
+verify:
+  rounding_decimals: 32
+  force_hook_hw: true
+  print_conv_shapes: true
+  print_linear_shapes: true
+  print_table: true
+  verbose: true

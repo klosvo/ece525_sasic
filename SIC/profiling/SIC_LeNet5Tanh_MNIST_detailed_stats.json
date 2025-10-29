@@ -1,0 +1,401 @@
+{
+  "global": {
+    "start_time": null,
+    "end_time": null,
+    "total_duration": 0.0,
+    "original_params": 0,
+    "final_params": 0,
+    "effective_params": 0,
+    "zero_params": 0,
+    "compression_ratio": 0.0,
+    "memory_peak_mb": 0.0,
+    "memory_saved_mb": 0.0
+  },
+  "phases": {
+    "initialization": {
+      "duration": 0.0
+    },
+    "filtering": {
+      "duration": 0.0,
+      "samples_before": 0,
+      "samples_after": 0
+    },
+    "clustering": {
+      "duration": 0.0,
+      "total_neurons": 0,
+      "successful_neurons": 0
+    },
+    "merging": {
+      "duration": 0.0,
+      "merges_performed": 0
+    },
+    "verification": {
+      "duration": 0.0,
+      "checks_performed": 0
+    }
+  },
+  "layers": {},
+  "convergence": {
+    "clustering_attempts": [],
+    "failure_reasons": {},
+    "efficiency_metrics": {}
+  },
+  "timing_breakdown": {},
+  "memory_timeline": [],
+  "verification": {
+    "layers": {
+      "conv1": {
+        "total": 17,
+        "nonzero": 17,
+        "unique": 17,
+        "bias_count": 20,
+        "sparsity_%": 0.0,
+        "compression_x": 1.0,
+        "dense_multiplications": 288000,
+        "dense_additions": 288000,
+        "pos_multiplications": 9792,
+        "pos_additions": 149760,
+        "sparse_multiplications": 0,
+        "sparse_additions": 0,
+        "mode": "PoS",
+        "HoWo_source": "hook",
+        "batch_size": 1,
+        "macs": 9792,
+        "macs_definition": "MACs == multiplications (\u00d7 batch size)",
+        "macs_naive_sparse": 144000,
+        "flops_pairMAC": 19584,
+        "flops_additive": 159552,
+        "in_shape": [
+          1,
+          1,
+          28,
+          28
+        ],
+        "out_shape": [
+          1,
+          20,
+          24,
+          24
+        ],
+        "units_out": null,
+        "neurons_out": 11520,
+        "channels_out": 20,
+        "weights_table": {
+          "layer": "Conv 1",
+          "filters": 20,
+          "kernel": "5x5",
+          "stride": "1x1",
+          "units": 11520,
+          "multiplications": 9792,
+          "count": 17
+        }
+      },
+      "conv2": {
+        "total": 99,
+        "nonzero": 99,
+        "unique": 99,
+        "bias_count": 50,
+        "sparsity_%": 0.0,
+        "compression_x": 1.0,
+        "dense_multiplications": 1600000,
+        "dense_additions": 1600000,
+        "pos_multiplications": 6336,
+        "pos_additions": 1089024,
+        "sparse_multiplications": 0,
+        "sparse_additions": 0,
+        "mode": "PoS",
+        "HoWo_source": "hook",
+        "batch_size": 1,
+        "macs": 6336,
+        "macs_definition": "MACs == multiplications (\u00d7 batch size)",
+        "macs_naive_sparse": 1088000,
+        "flops_pairMAC": 12672,
+        "flops_additive": 1095360,
+        "in_shape": [
+          1,
+          20,
+          12,
+          12
+        ],
+        "out_shape": [
+          1,
+          50,
+          8,
+          8
+        ],
+        "units_out": null,
+        "neurons_out": 3200,
+        "channels_out": 50,
+        "weights_table": {
+          "layer": "Conv 2",
+          "filters": 50,
+          "kernel": "5x5",
+          "stride": "1x1",
+          "units": 64000,
+          "multiplications": 6336,
+          "count": 99
+        }
+      },
+      "fc1": {
+        "total": 466,
+        "nonzero": 466,
+        "unique": 466,
+        "bias_count": 500,
+        "sparsity_%": 0.0,
+        "compression_x": 1.0,
+        "dense_multiplications": 400000,
+        "dense_additions": 400000,
+        "pos_multiplications": 466,
+        "pos_additions": 141124,
+        "sparse_multiplications": 0,
+        "sparse_additions": 0,
+        "mode": "PoS",
+        "HoWo_source": "-",
+        "batch_size": 1,
+        "macs": 466,
+        "macs_definition": "MACs == multiplications (\u00d7 batch size)",
+        "macs_naive_sparse": 140800,
+        "flops_pairMAC": 932,
+        "flops_additive": 141590,
+        "in_shape": [
+          1,
+          800
+        ],
+        "out_shape": [
+          1,
+          500
+        ],
+        "units_out": 500,
+        "neurons_out": null,
+        "channels_out": null,
+        "weights_table": {
+          "layer": "FC 1",
+          "filters": 500,
+          "kernel": "-",
+          "stride": "-",
+          "units": 500,
+          "multiplications": 466,
+          "count": 466
+        }
+      },
+      "fc2": {
+        "total": 40,
+        "nonzero": 40,
+        "unique": 40,
+        "bias_count": 10,
+        "sparsity_%": 0.0,
+        "compression_x": 1.0,
+        "dense_multiplications": 5000,
+        "dense_additions": 5000,
+        "pos_multiplications": 40,
+        "pos_additions": 5000,
+        "sparse_multiplications": 0,
+        "sparse_additions": 0,
+        "mode": "PoS",
+        "HoWo_source": "-",
+        "batch_size": 1,
+        "macs": 40,
+        "macs_definition": "MACs == multiplications (\u00d7 batch size)",
+        "macs_naive_sparse": 5000,
+        "flops_pairMAC": 80,
+        "flops_additive": 5040,
+        "in_shape": [
+          1,
+          500
+        ],
+        "out_shape": [
+          1,
+          10
+        ],
+        "units_out": 10,
+        "neurons_out": null,
+        "channels_out": null,
+        "weights_table": {
+          "layer": "FC 2",
+          "filters": 10,
+          "kernel": "-",
+          "stride": "-",
+          "units": 10,
+          "multiplications": 40,
+          "count": 40
+        }
+      }
+    },
+    "total": {
+      "total_params": 622,
+      "total_nonzero": 622,
+      "total_unique": 622,
+      "total_conv_neurons": 14720,
+      "total_linear_units": 510
+    },
+    "total_bias_count": 580,
+    "dense_ops_totals": {
+      "multiplications": 2293000,
+      "additions": 2293000
+    },
+    "pos_ops_totals": {
+      "multiplications": 16634,
+      "additions": 1384908
+    },
+    "sparse_ops_totals": {
+      "multiplications": 0,
+      "additions": 0
+    },
+    "macs_totals": {
+      "per_forward": 16634,
+      "naive_sparse": 1377800
+    },
+    "flops_totals": {
+      "pairMAC": 33268,
+      "additive": 1401542
+    },
+    "dry_run_shapes": {
+      "conv1": {
+        "in": [
+          1,
+          1,
+          28,
+          28
+        ],
+        "out": [
+          1,
+          20,
+          24,
+          24
+        ]
+      },
+      "pool1": {
+        "in": [
+          1,
+          20,
+          24,
+          24
+        ],
+        "out": [
+          1,
+          20,
+          12,
+          12
+        ]
+      },
+      "conv2": {
+        "in": [
+          1,
+          20,
+          12,
+          12
+        ],
+        "out": [
+          1,
+          50,
+          8,
+          8
+        ]
+      },
+      "pool2": {
+        "in": [
+          1,
+          50,
+          8,
+          8
+        ],
+        "out": [
+          1,
+          50,
+          4,
+          4
+        ]
+      },
+      "fc1": {
+        "in": [
+          1,
+          800
+        ],
+        "out": [
+          1,
+          500
+        ]
+      },
+      "fc2": {
+        "in": [
+          1,
+          500
+        ],
+        "out": [
+          1,
+          10
+        ]
+      }
+    },
+    "static_inferred_hw": {},
+    "tried_input_shapes": [
+      [
+        1,
+        1,
+        28,
+        28
+      ]
+    ],
+    "rounding_decimals": 32,
+    "flags": {
+      "force_hook_hw": false,
+      "print_conv_shapes": false,
+      "print_linear_shapes": false
+    },
+    "unit_totals": {
+      "linear_units": 510,
+      "conv_neurons": 14720,
+      "conv_channels_when_hw_unknown": 0,
+      "units_plus_neurons": 15230
+    },
+    "weights_table": {
+      "total_weight_params": 622,
+      "rows": [
+        {
+          "layer": "Conv 1",
+          "name": "conv1",
+          "filters": 20,
+          "kernel": "5x5",
+          "stride": "1x1",
+          "units": 11520,
+          "multiplications": 9792,
+          "count": 17,
+          "distribution_pct": 2.7331189710610935
+        },
+        {
+          "layer": "Conv 2",
+          "name": "conv2",
+          "filters": 50,
+          "kernel": "5x5",
+          "stride": "1x1",
+          "units": 64000,
+          "multiplications": 6336,
+          "count": 99,
+          "distribution_pct": 15.916398713826366
+        },
+        {
+          "layer": "FC 1",
+          "name": "fc1",
+          "filters": 500,
+          "kernel": "-",
+          "stride": "-",
+          "units": 500,
+          "multiplications": 466,
+          "count": 466,
+          "distribution_pct": 74.91961414790997
+        },
+        {
+          "layer": "FC 2",
+          "name": "fc2",
+          "filters": 10,
+          "kernel": "-",
+          "stride": "-",
+          "units": 10,
+          "multiplications": 40,
+          "count": 40,
+          "distribution_pct": 6.430868167202572
+        }
+      ]
+    }
+  }
+}

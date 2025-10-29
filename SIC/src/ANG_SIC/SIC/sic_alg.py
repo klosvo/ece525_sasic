@@ -1,0 +1,584 @@
+from typing import Optional, Tuple, Union, List, Dict, Any
+import numpy as np
+import torch
+import torch.nn as nn
+from time import perf_counter
+import jenkspy
+
+from .profiling import SICProfiler, MemoryTracker
+from ..core.config import LogBuffer
+from .sic_utils import all_samples_correct
+from ..core.numeric import clamp_decimals, round_tensor
+from ..core.acceptance import build_acceptance_subset_from_loaders
+from .pos_common import is_pos_linear, is_pos_conv2d
+
+def _jenks_breaks(arr: np.ndarray, k: int) -> np.ndarray:
+    return np.asarray(jenkspy.jenks_breaks(np.asarray(arr, dtype=float), int(k)), dtype=float)
+
+def _flatten_weight(w: torch.Tensor) -> torch.Tensor:
+    return w.view(w.size(0), -1) if w.ndim > 2 else w
+
+def _uwc(model: nn.Module, decimals: int, exclude_zero: bool = True) -> int:
+    s = set()
+    scale = float(10 ** max(0, int(decimals)))
+    for m in model.modules():
+        if hasattr(m, "weight") and torch.is_tensor(getattr(m, "weight")):
+            v = m.weight.detach().view(-1).cpu().numpy()
+            v = np.round(v * scale) / scale
+            if exclude_zero:
+                v = v[v != 0.0]
+            s.update(v.tolist())
+        if _is_indexed_sparse_linear(m):
+            v = m.theta.detach().view(-1).cpu().numpy()
+            v = np.round(v * scale) / scale
+            if exclude_zero:
+                v = v[v != 0.0]
+            s.update(v.tolist())
+    return len(s)
+
+def _should_gpu_rowlen(row_len: int, sic_cfg: dict) -> bool:
+    return int(row_len) >= int(sic_cfg.get("gpu_row_len_min", 2048))
+
+def _is_indexed_sparse_linear(m: nn.Module) -> bool:
+    return (
+        hasattr(m, "indices") and torch.is_tensor(getattr(m, "indices"))
+        and hasattr(m, "theta") and torch.is_tensor(getattr(m, "theta"))
+        and hasattr(m, "bias") and torch.is_tensor(getattr(m, "bias"))
+        and hasattr(m, "in_features") and hasattr(m, "out_features")
+        and not hasattr(m, "weight")
+    )
+
+def _is_excluded_by_name(name: str, sic_cfg: dict) -> bool:
+    skip = set(sic_cfg.get("exclude_modules_by_name", []))
+    return any(name == pat or name.endswith(pat) for pat in skip)
+
+def _row_slice_indexed_sparse(m: nn.Module, r: int) -> Tuple[torch.Tensor, torch.Tensor, Union[int, torch.Tensor], Optional[int]]:
+    if hasattr(m, "row_ptr") and torch.is_tensor(getattr(m, "row_ptr")) and m.row_ptr.numel() >= 2:
+        s = int(m.row_ptr[r].item())
+        e = int(m.row_ptr[r + 1].item())
+        cols = m.indices[1, s:e]
+        vals = m.theta[s:e]
+        return cols, vals, s, e
+    row_ids = m.indices[0]
+    sel = torch.nonzero(row_ids == r, as_tuple=False).view(-1)
+    cols = m.indices[1, sel]
+    vals = m.theta.index_select(0, sel)
+    return cols, vals, sel, None
+
+def _write_back_indexed_sparse_vals(m: nn.Module, s: Union[int, torch.Tensor], e: Optional[int], vals: torch.Tensor) -> None:
+    if e is None:
+        m.theta.index_copy_(0, s.to(m.theta.device), vals.to(m.theta.device))
+    else:
+        m.theta[s:e] = vals.to(m.theta.device)
+
+@torch.inference_mode()
+def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: bool, profiler: Optional[SICProfiler], cfg: Optional[Dict[str, Any]], val_loader=None, mode: str = "classic"):
+    cfg = cfg or {}
+    sic_cfg = cfg.get("sic", {}) or {}
+    io_cfg = cfg.get("io", {}) or {}
+
+    rounding_decimals = int(sic_cfg.get("rounding_decimals", 6))
+    neuron_log_path = io_cfg.get("neuron_log_path", "SIC_per_neuron_times.jsonl")
+    log_flush_every = int(io_cfg.get("log_flush_every", 1000))
+    enable_neuron_log = bool(io_cfg.get("enable_neuron_log", True))
+    enable_autosave = bool(io_cfg.get("enable_autosave_progress", True))
+    autosave_path = io_cfg.get("autosave_progress_path", "SIC_Progress_Autosave.json")
+    autosave_each = bool(sic_cfg.get("autosave_json_each_layer", True)) and enable_autosave
+    eval_max = sic_cfg.get("eval_max", None)
+    eval_max = None if eval_max in (None, "null", 0, "0") else int(eval_max)
+    max_passes = int(sic_cfg.get("max_passes", 1))
+    merge_after = bool(sic_cfg.get("merge_after_clustering", True))
+    max_k_per_neuron = int(sic_cfg.get("max_k_per_neuron", 1_000_000))
+    progress = bool(sic_cfg.get("progress", True))
+    debug_skip = bool(sic_cfg.get("debug_skip", False))
+    uwc_exclude_zero = bool(sic_cfg.get("uwc_exclude_zero", True))
+
+    if bool(sic_cfg.get("compile_model", False)) and hasattr(torch, "compile"):
+        model = torch.compile(model)
+
+    uwc_patience = int(sic_cfg.get("uwc_patience", 1))
+    uwc_min_rel_delta = float(sic_cfg.get("uwc_min_rel_delta", 0.0))
+    stale_uwc = 0
+    prev_uwc = _uwc(model, rounding_decimals, exclude_zero=uwc_exclude_zero)
+
+    min_pass_weight_delta = float(sic_cfg.get("min_pass_weight_delta", 0.0))
+
+    def _asc_gate(eval_cap: Optional[int]):
+        ok, _ = all_samples_correct(model, filtered_dataset, device, eval_max=eval_cap, profiler=profiler)
+        return ok
+
+    tiered = sic_cfg.get("tiered_asc", {}) or {}
+    tier_enable = bool(tiered.get("enable", False))
+    tier_fast = int(tiered.get("fast", 256))
+    tier_med = int(tiered.get("medium", 1024))
+
+    def _asc_progressive():
+        if not tier_enable:
+            return _asc_gate(eval_max)
+        total = len(filtered_dataset)
+        if not _asc_gate(min(tier_fast, total)):
+            return False
+        if not _asc_gate(min(tier_med, total)):
+            return False
+        return _asc_gate(eval_max)
+
+    profiler = profiler or SICProfiler()
+    profiler.start_profiling(memory_tracker=MemoryTracker())
+    torch.set_grad_enabled(False)
+    model.eval()
+
+    profiler.stats["global"]["original_params"] = sum(p.numel() for p in model.parameters())
+    profiler.start_phase("initialization")
+    profiler.end_phase("initialization")
+
+    profiler.start_phase("filtering")
+    filtered_dataset = build_acceptance_subset_from_loaders(
+        model=model,
+        train_loader=train_loader,
+        device=device,
+        val_loader=val_loader,
+        from_spec=(cfg.get("sic", {}).get("acceptance_from", "train+val")),
+        max_examples=eval_max,
+    )
+    profiler.stats["phases"]["filtering"]["samples_before"] = None
+    profiler.stats["phases"]["filtering"]["samples_after"] = int(len(filtered_dataset))
+    profiler.end_phase("filtering")
+
+    profiler.start_phase("clustering")
+    neuron_log = LogBuffer(neuron_log_path, flush_every=log_flush_every) if enable_neuron_log else None
+    total_neurons = 0
+    total_success = 0
+    initial_layer_flats: Dict[str, np.ndarray] = {}
+
+    for pass_idx in range(max_passes):
+        changed_any = False
+        pass_t0 = perf_counter()
+
+        w_before = {
+            n: m.weight.detach().clone()
+            for n, m in model.named_modules()
+            if hasattr(m, "weight") and torch.is_tensor(getattr(m, "weight"))
+        }
+        theta_before = {
+            n: m.theta.detach().clone()
+            for n, m in model.named_modules()
+            if _is_indexed_sparse_linear(m)
+        }
+
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                continue
+            if _is_excluded_by_name(name, sic_cfg):
+                if debug_skip:
+                    print(f"[SIC] Skipping by name: {name}")
+                continue
+            if is_pos_linear(module) or is_pos_conv2d(module):
+                if debug_skip:
+                    print(f"[SIC] Skipping PoS/fast-PoS (no weight): {name}")
+                continue
+
+            if hasattr(module, "weight") and torch.is_tensor(getattr(module, "weight")):
+                layer_t0 = perf_counter()
+                w = module.weight
+                shp = tuple(w.shape)
+                flat = _flatten_weight(w)
+
+                if pass_idx == 0:
+                    before_flat_cpu = flat.detach().cpu().numpy()
+                    initial_layer_flats[name] = before_flat_cpu.copy()
+                    total_neurons += flat.size(0)
+                    profiler.init_layer_stats(name, shp, int(w.numel()))
+                    profiler.record_weight_distribution(name, before_flat_cpu, before_flat_cpu)
+
+                best_flat = flat.clone()
+                success_count_this_layer = 0
+                num_neurons = flat.size(0)
+                pos_clusters_for_layer = getattr(module, "_sic_pos_clusters", [[] for _ in range(num_neurons)])
+                if len(pos_clusters_for_layer) != num_neurons:
+                    pos_clusters_for_layer = [[] for _ in range(num_neurons)]
+
+                freeze_patience = int(sic_cfg.get("neuron_patience", 0))
+                no_change = getattr(module, "_sic_no_change", [0] * num_neurons)
+                if len(no_change) != num_neurons:
+                    no_change = [0] * num_neurons
+
+                use_gpu = (w.device.type == "cuda") and _should_gpu_rowlen(flat.size(1), sic_cfg) if mode == "hybrid" else False
+
+                for idx in range(num_neurons):
+                    if freeze_patience > 0 and no_change[idx] >= freeze_patience:
+                        profiler.record_neuron_attempt(name, idx, 0, False, "frozen_by_patience")
+                        continue
+
+                    orig_t = flat[idx].clone()
+                    orig_np = orig_t.detach().cpu().numpy()
+                    nz = orig_np != 0
+                    vals = orig_np[nz]
+                    if vals.size == 0:
+                        profiler.record_neuron_attempt(name, idx, 0, True, "all_zero_weights")
+                        if neuron_log:
+                            neuron_log.add({"layer": name, "neuron_idx": idx})
+                        no_change[idx] = 0
+                        continue
+
+                    converged = False
+                    uniq_nz = int(np.unique(vals).size)
+                    max_k = max(1, min(uniq_nz - 1, max_k_per_neuron))
+
+                    flat[idx] = torch.zeros_like(orig_t)
+                    ok = _asc_progressive()
+                    if ok:
+                        best_flat[idx] = flat[idx]
+                        success_count_this_layer += 1
+                        total_success += 1
+                        profiler.record_neuron_attempt(name, idx, 0, True, "zeroed_perceptron")
+                        pos_clusters_for_layer[idx] = []
+                        changed_any = True
+                        converged = True
+                        no_change[idx] = 0
+                    else:
+                        flat[idx] = orig_t
+                        profiler.record_neuron_attempt(name, idx, 0, False, "zero_rejected")
+
+                    for k in range(1, max_k + 1):
+                        if converged:
+                            break
+                        if progress:
+                            print(
+                                f"[SIC-{mode}] pass {pass_idx+1}/{max_passes} | {name} n={idx+1}/{num_neurons} k={k}    ",
+                                end="\r",
+                                flush=True,
+                            )
+
+                        breaks = _jenks_breaks(vals, k)
+
+                        if use_gpu:
+                            v = orig_t.clone()
+                            mask = v != 0
+                            vv = v[mask]
+                            b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                            bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
+                            G = b.numel() - 1
+                            means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                            counts = torch.zeros_like(means)
+                            means.index_add_(0, bin_ids, vv)
+                            counts.index_add_(0, bin_ids, torch.ones_like(vv))
+                            counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                            means = means / counts
+                            vv_repl = means[bin_ids]
+                            trial_t = orig_t.clone()
+                            trial_t[mask] = vv_repl
+                            flat[idx] = trial_t
+                            row_pos: List[Tuple[torch.Tensor, float]] = []
+                            sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
+                            bin_ids_cpu = bin_ids.detach().cpu()
+                            means_cpu = means.detach().cpu()
+                            for g in range(G):
+                                g_mask = (bin_ids_cpu == g)
+                                if int(g_mask.sum().item()) == 0:
+                                    continue
+                                idxs_cpu = sel_idx[g_mask]
+                                row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                        else:
+                            new_flat = orig_np.copy()
+                            row_pos = []
+                            for i_c in range(len(breaks) - 1):
+                                lo, hi = breaks[i_c], breaks[i_c + 1]
+                                if i_c == 0:
+                                    sel = (orig_np >= lo) & (orig_np <= hi) & nz
+                                    group = vals[(vals >= lo) & (vals <= hi)]
+                                else:
+                                    sel = (orig_np > lo) & (orig_np <= hi) & nz
+                                    group = vals[(vals > lo) & (vals <= hi)]
+                                if np.any(sel):
+                                    avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                    new_flat[sel] = avg
+                                    idxs = np.where(sel)[0]
+                                    row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            trial_t = torch.from_numpy(new_flat).to(orig_t.device, dtype=module.weight.dtype)
+                            flat[idx] = trial_t
+
+                        ok = _asc_progressive()
+                        if ok:
+                            best_flat[idx] = flat[idx]
+                            success_count_this_layer += 1
+                            total_success += 1
+                            if row_pos is not None:
+                                pos_clusters_for_layer[idx] = row_pos
+                            profiler.record_neuron_attempt(name, idx, k, True, "converged")
+                            changed_any = True
+                            converged = True
+                            no_change[idx] = 0
+                            break
+                        else:
+                            profiler.record_neuron_attempt(name, idx, k, False, "accuracy_loss")
+                            flat[idx] = orig_t
+
+                    if not converged:
+                        profiler.record_neuron_attempt(name, idx, max_k, False, "max_clusters_exceeded")
+                        no_change[idx] = no_change[idx] + 1
+
+                with torch.no_grad():
+                    module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
+                setattr(module, "_sic_pos_clusters", pos_clusters_for_layer)
+                setattr(module, "_sic_no_change", no_change)
+                if autosave_each and autosave_path:
+                    profiler.save_detailed_stats(autosave_path)
+                profiler.record_layer_processing(name, perf_counter() - layer_t0, success_count_this_layer, num_neurons)
+                if progress:
+                    print(" " * 120, end="\r")
+                continue
+
+            if _is_indexed_sparse_linear(module):
+                layer_t0 = perf_counter()
+                K = int(module.out_features)
+                D = int(module.in_features)
+
+                if pass_idx == 0:
+                    before_cpu = module.theta.detach().view(-1).cpu().numpy()
+                    initial_layer_flats[name] = before_cpu.copy()
+                    total_neurons += K
+                    profiler.init_layer_stats(name, (K, D), int(module.theta.numel()))
+                    profiler.record_weight_distribution(name, before_cpu, before_cpu)
+
+                success_count_this_layer = 0
+                pos_clusters_for_layer = getattr(module, "_sic_pos_clusters", [[] for _ in range(K)])
+                if len(pos_clusters_for_layer) != K:
+                    pos_clusters_for_layer = [[] for _ in range(K)]
+
+                freeze_patience = int(sic_cfg.get("neuron_patience", 0))
+                no_change = getattr(module, "_sic_no_change", [0] * K)
+                if len(no_change) != K:
+                    no_change = [0] * K
+
+                avg_row_len = (module.theta.numel() // max(1, K))
+                use_gpu = (module.theta.device.type == "cuda") and _should_gpu_rowlen(max(D, avg_row_len), sic_cfg) if mode == "hybrid" else False
+
+                for r in range(K):
+                    if freeze_patience > 0 and no_change[r] >= freeze_patience:
+                        profiler.record_neuron_attempt(name, r, 0, False, "frozen_by_patience")
+                        continue
+
+                    cols, vals_view, s_or_idx, e = _row_slice_indexed_sparse(module, r)
+                    if vals_view.numel() == 0:
+                        profiler.record_neuron_attempt(name, r, 0, True, "all_zero_edges")
+                        if neuron_log:
+                            neuron_log.add({"layer": name, "neuron_idx": r})
+                        no_change[r] = 0
+                        continue
+
+                    orig_vals = vals_view.detach().clone()
+                    orig_np = orig_vals.detach().cpu().numpy()
+                    nz_vals = orig_np
+                    uniq_nz = int(np.unique(nz_vals).size)
+                    max_k = max(1, min(uniq_nz - 1, max_k_per_neuron))
+                    converged = False
+
+                    _write_back_indexed_sparse_vals(module, s_or_idx, e, torch.zeros_like(orig_vals))
+                    ok = _asc_progressive()
+                    if ok:
+                        success_count_this_layer += 1
+                        total_success += 1
+                        profiler.record_neuron_attempt(name, r, 0, True, "zeroed_perceptron")
+                        pos_clusters_for_layer[r] = []
+                        changed_any = True
+                        converged = True
+                        no_change[r] = 0
+                    else:
+                        _write_back_indexed_sparse_vals(module, s_or_idx, e, orig_vals)
+                        profiler.record_neuron_attempt(name, r, 0, False, "zero_rejected")
+
+                    for k in range(1, max_k + 1):
+                        if converged:
+                            break
+                        if progress:
+                            print(
+                                f"[SIC-{mode}] pass {pass_idx+1}/{max_passes} | {name} row={r+1}/{K} k={k}    ",
+                                end="\r",
+                                flush=True,
+                            )
+
+                        breaks = _jenks_breaks(nz_vals, k)
+
+                        if use_gpu:
+                            v = orig_vals.clone().to(module.theta.device)
+                            b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                            bin_ids = torch.clamp(torch.bucketize(v, b) - 1, 0, b.numel() - 2)
+                            G = b.numel() - 1
+                            means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                            counts = torch.zeros_like(means)
+                            means.index_add_(0, bin_ids, v)
+                            counts.index_add_(0, bin_ids, torch.ones_like(v))
+                            counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                            means = means / counts
+                            trial_vals = means[bin_ids]
+                            _write_back_indexed_sparse_vals(module, s_or_idx, e, trial_vals)
+                            row_pos = []
+                            bin_ids_cpu = bin_ids.detach().cpu()
+                            means_cpu = means.detach().cpu()
+                            cols_cpu = cols.detach().cpu()
+                            for g in range(G):
+                                g_mask = (bin_ids_cpu == g)
+                                if int(g_mask.sum().item()) == 0:
+                                    continue
+                                idxs_cpu = cols_cpu[g_mask]
+                                row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                        else:
+                            new_vals = orig_np.copy()
+                            row_pos = []
+                            for i_c in range(len(breaks) - 1):
+                                lo, hi = breaks[i_c], breaks[i_c + 1]
+                                if i_c == 0:
+                                    sel = (orig_np >= lo) & (orig_np <= hi)
+                                    group = orig_np[(orig_np >= lo) & (orig_np <= hi)]
+                                else:
+                                    sel = (orig_np > lo) & (orig_np <= hi)
+                                    group = orig_np[(orig_np > lo) & (orig_np <= hi)]
+                                if np.any(sel):
+                                    avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                    new_vals[sel] = avg
+                                    idxs = cols.detach().cpu().numpy()[sel]
+                                    row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            trial_vals = torch.from_numpy(new_vals).to(module.theta.device, dtype=module.theta.dtype)
+                            _write_back_indexed_sparse_vals(module, s_or_idx, e, trial_vals)
+
+                        ok = _asc_progressive()
+                        if ok:
+                            success_count_this_layer += 1
+                            total_success += 1
+                            if row_pos is not None:
+                                pos_clusters_for_layer[r] = row_pos
+                            profiler.record_neuron_attempt(name, r, k, True, "converged")
+                            changed_any = True
+                            converged = True
+                            no_change[r] = 0
+                            break
+                        else:
+                            profiler.record_neuron_attempt(name, r, k, False, "accuracy_loss")
+                            _write_back_indexed_sparse_vals(module, s_or_idx, e, orig_vals)
+
+                    if not converged:
+                        profiler.record_neuron_attempt(name, r, max_k, False, "max_clusters_exceeded")
+                        no_change[r] = no_change[r] + 1
+                        _write_back_indexed_sparse_vals(module, s_or_idx, e, orig_vals)
+
+                after_cpu = module.theta.detach().view(-1).cpu().numpy()
+                profiler.record_weight_distribution(name, initial_layer_flats[name], after_cpu)
+                setattr(module, "_sic_pos_clusters", pos_clusters_for_layer)
+                setattr(module, "_sic_no_change", no_change)
+                if autosave_each and autosave_path:
+                    profiler.save_detailed_stats(autosave_path)
+                profiler.record_layer_processing(name, perf_counter() - layer_t0, success_count_this_layer, K)
+                if progress:
+                    print(" " * 120, end="\r")
+                continue
+
+            if debug_skip:
+                print(f"[SIC] Skipping unsupported module: {name}")
+
+        max_abs = 0.0
+        for n, m in model.named_modules():
+            if hasattr(m, "weight") and torch.is_tensor(getattr(m, "weight")):
+                d = (m.weight - w_before[n]).abs().max().item()
+                max_abs = max(max_abs, d)
+        for n, m in model.named_modules():
+            if _is_indexed_sparse_linear(m):
+                d = (m.theta - theta_before[n]).abs().max().item()
+                max_abs = max(max_abs, d)
+
+        stop_by_small_delta = max_abs < min_pass_weight_delta
+
+        curr_uwc = _uwc(model, rounding_decimals, exclude_zero=uwc_exclude_zero)
+        denom = max(1.0, float(prev_uwc))
+        uwc_rel_drop = max(0.0, (float(prev_uwc) - float(curr_uwc))) / denom
+
+        rec = {
+            "pass_index": pass_idx + 1,
+            "changed_any": bool(changed_any),
+            "duration_sec": round(perf_counter() - pass_t0, 6),
+            "unique_weight_count": int(curr_uwc),
+            "uwc_rel_drop": float(uwc_rel_drop),
+            "max_abs_weight_delta": float(max_abs),
+        }
+
+        if (curr_uwc == prev_uwc) or (uwc_rel_drop < uwc_min_rel_delta):
+            stale_uwc += 1
+        else:
+            stale_uwc = 0
+        stop_by_uwc = stale_uwc >= uwc_patience
+
+        prev_uwc = curr_uwc
+        profiler.stats.setdefault("passes", []).append(rec)
+
+        if (not changed_any) or stop_by_uwc or stop_by_small_delta:
+            break
+
+    for name, module in model.named_modules():
+        if _is_indexed_sparse_linear(module) and (name in initial_layer_flats):
+            after_cpu = module.theta.detach().view(-1).cpu().numpy()
+            profiler.record_weight_distribution(name, initial_layer_flats[name], after_cpu)
+
+    if neuron_log:
+        neuron_log.flush()
+
+    profiler.stats["phases"]["clustering"]["total_neurons"] = total_neurons
+    profiler.stats["phases"]["clustering"]["successful_neurons"] = total_success
+    profiler.end_phase("clustering")
+
+    if merge_after:
+        profiler.start_phase("merging")
+        merges = 0
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if hasattr(module, "weight") and torch.is_tensor(getattr(module, "weight")):
+                    w = module.weight
+                    flat_t = _flatten_weight(w).clone()
+                    rd = clamp_decimals(rounding_decimals)
+                    rnd = round_tensor(flat_t, rd)
+                    nz = flat_t != 0
+                    for i in range(flat_t.size(0)):
+                        row = flat_t[i]
+                        rr = rnd[i]
+                        mask = nz[i]
+                        if not mask.any():
+                            continue
+                        for u in torch.unique(rr[mask]):
+                            idxs = (rr == u) & mask
+                            if int(idxs.sum().item()) > 1:
+                                row[idxs] = row[idxs].mean()
+                                merges += 1
+                    module.weight.copy_(flat_t.view_as(w) if w.ndim > 2 else flat_t)
+            for name, module in model.named_modules():
+                if not _is_indexed_sparse_linear(module):
+                    continue
+                K = int(module.out_features)
+                rd = clamp_decimals(rounding_decimals)
+                for r in range(K):
+                    cols, vals_view, s_or_idx, e = _row_slice_indexed_sparse(module, r)
+                    if vals_view.numel() == 0:
+                        continue
+                    v = vals_view.clone()
+                    vr = round_tensor(v, rd)
+                    uniq = torch.unique(vr)
+                    new_vals = v.clone()
+                    for u in uniq:
+                        mask = (vr == u)
+                        if int(mask.sum().item()) > 1:
+                            new_vals[mask] = v[mask].mean()
+                            merges += 1
+                    _write_back_indexed_sparse_vals(module, s_or_idx, e, new_vals)
+        profiler.stats["phases"]["merging"]["merges_performed"] = merges
+        profiler.end_phase("merging")
+
+    profiler.start_phase("verification")
+    profiler.end_phase("verification")
+    profiler.end_profiling()
+    torch.set_grad_enabled(True)
+    return model, profiler.stats
+
+@torch.inference_mode()
+def SIC_hybrid(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="hybrid")
+
+@torch.inference_mode()
+def SIC(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="classic")
