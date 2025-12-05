@@ -1,3 +1,4 @@
+# Dev config for fast SIC/SASIC experiments on HPC (no pruning, no compile)
 # =========================
 # Top-level
 # =========================
@@ -42,7 +43,7 @@ sic:
   rounding_decimals: 32
   max_passes: 1
   repeat_until_no_change: true
-  max_k_per_neuron: 1000000
+  max_k_per_neuron: 4
   neuron_patience: 2
 
   # Acceptance subset (ASC) controls
@@ -78,8 +79,9 @@ sic:
   min_pass_weight_delta: 0.0
 
   # PoS materialization & acceleration
-  enable_product_of_sums: true  
-  fast_pos_accel: true           
+  enable_product_of_sums: true 
+  # The key point: do NOT use PoS-specific compile/accel paths in dev runs. 
+  fast_pos_accel: false           
   fast_pos_compile: false
 
 # =========================
