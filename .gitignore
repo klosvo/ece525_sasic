@@ -1,15 +1,11 @@
 # Datasets
 data/
-data/*
-SIC/data/
 
 # Saved models / checkpoints
 saved_models/
-SIC/saved_models/
 
 # Profiling / logs
 profiling/
-SIC/profiling/
 
 # Python cache
 __pycache__/
