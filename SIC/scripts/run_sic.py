@@ -145,6 +145,9 @@ def main():
     )
 
     # Build calibration loader for SASIC if enabled
+    # TODO: Enforce strict class-balance in calibration slice (sasic_design.md §4.1).
+    #       Currently uses random subset via calibration_fraction. Future improvement:
+    #       sample equal number of examples per class (e.g., 50-100 per class, capped).
     calibration_loader = None
     sasic_cfg = cfg.get("sasic", {}) or {}
     if sasic_cfg.get("enabled", False) and sasic_cfg.get("mode") == "active":
@@ -428,9 +431,15 @@ def main():
         final_val_acc = float(evaluate(model.to(device_eval).eval(), val_loader, device_eval))
         print(f"[EVAL] Val  (final): {final_val_acc:.2f}%")
 
+    # Merge final verification stats into the SIC run profiler
+    # (The SIC profiler already has end_profiling() called and derived stats computed)
+    if "verification" in final_profiler.stats:
+        sic_profiler.stats["verification"] = final_profiler.stats["verification"]
+
     if json_path:
         ensure_parent_dir(json_path)
-        final_profiler.save_detailed_stats(json_path)
+        # Save the SIC profiler (not final_profiler) - it contains all clustering/phases/layers stats
+        sic_profiler.save_detailed_stats(json_path)
         print(f"[SIC] Profiler JSON saved: {json_path}")
 
     if bool(cfg["io"].get("write_full_weights_to_excel", False)):
@@ -438,11 +447,11 @@ def main():
         global_df = pd.DataFrame(
             [
                 {
-                    "start_time": final_profiler.stats["global"].get("start_time"),
-                    "end_time": final_profiler.stats["global"].get("end_time"),
-                    "total_duration_sec": final_profiler.stats["global"].get("total_duration", 0.0),
-                    "memory_peak_mb": final_profiler.stats["global"].get("memory_peak_mb", 0.0),
-                    "memory_saved_mb": final_profiler.stats["global"].get("memory_saved_mb", 0.0),
+                    "start_time": sic_profiler.stats["global"].get("start_time"),
+                    "end_time": sic_profiler.stats["global"].get("end_time"),
+                    "total_duration_sec": sic_profiler.stats["global"].get("total_duration", 0.0),
+                    "memory_peak_mb": sic_profiler.stats["global"].get("memory_peak_mb", 0.0),
+                    "memory_saved_mb": sic_profiler.stats["global"].get("memory_saved_mb", 0.0),
                 }
             ]
         )

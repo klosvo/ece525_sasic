@@ -170,6 +170,11 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     total_neurons = 0
     total_success = 0
     initial_layer_flats: Dict[str, np.ndarray] = {}
+    
+    # Initialize run-level k-trials counters once (sasic_design.md §9: metrics and logging)
+    profiler.stats.setdefault("sic", {})
+    profiler.stats["sic"].setdefault("total_k_trials", 0)
+    profiler.stats["sic"].setdefault("num_neurons_evaluated", 0)
 
     for pass_idx in range(max_passes):
         changed_any = False
@@ -361,6 +366,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         # Count this k evaluation (regardless of accept/reject, baseline vs SASIC)
                         # (sasic_design.md §9: track number of k values attempted per neuron)
                         k_trials_this_neuron += 1
+                        profiler.stats["sic"]["total_k_trials"] += 1
                         
                         # SASIC Mode A clustering (sasic_design.md §5.1, step 3):
                         # Run Jenks clustering on {w_i : i in A} (active inputs only)
@@ -667,6 +673,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     
                     # Record k-trials for this neuron (for profiler stats)
                     # Track both per-layer and global totals (sasic_design.md §9: metrics and logging)
+                    # Per-layer stats use profiler.stats["layers"] schema (consistent with existing profiler)
                     if name not in profiler.stats["layers"]:
                         profiler.stats["layers"][name] = {}
                     layer_stats = profiler.stats["layers"][name]
@@ -674,15 +681,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         layer_stats["k_trials_list"] = []
                     layer_stats["k_trials_list"].append(k_trials_this_neuron)
                     
-                    # Initialize global k-trials counters if needed
-                    if "sic" not in profiler.stats:
-                        profiler.stats["sic"] = {}
-                    if "total_k_trials" not in profiler.stats["sic"]:
-                        profiler.stats["sic"]["total_k_trials"] = 0
-                    if "num_neurons_evaluated" not in profiler.stats["sic"]:
-                        profiler.stats["sic"]["num_neurons_evaluated"] = 0
-                    
-                    profiler.stats["sic"]["total_k_trials"] += k_trials_this_neuron
+                    # Increment neuron counter once per neuron (after k-loop finishes)
                     profiler.stats["sic"]["num_neurons_evaluated"] += 1
 
                 with torch.no_grad():
