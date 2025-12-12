@@ -50,7 +50,7 @@ sic:
   acceptance_from: "train+val"
   eval_max: 32
   tiered_asc:
-    enable: true
+    enable: false
     fast: 1024
     medium: 2048
 

@@ -72,10 +72,11 @@ def _write_back_indexed_sparse_vals(m: nn.Module, s: Union[int, torch.Tensor], e
         m.theta[s:e] = vals.to(m.theta.device)
 
 @torch.inference_mode()
-def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: bool, profiler: Optional[SICProfiler], cfg: Optional[Dict[str, Any]], val_loader=None, mode: str = "classic"):
+def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: bool, profiler: Optional[SICProfiler], cfg: Optional[Dict[str, Any]], val_loader=None, mode: str = "classic", calibration_loader=None):
     cfg = cfg or {}
     sic_cfg = cfg.get("sic", {}) or {}
     io_cfg = cfg.get("io", {}) or {}
+    sasic_cfg = cfg.get("sasic", {}) or {}
 
     rounding_decimals = int(sic_cfg.get("rounding_decimals", 6))
     neuron_log_path = io_cfg.get("neuron_log_path", "SIC_per_neuron_times.jsonl")
@@ -143,6 +144,26 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     profiler.stats["phases"]["filtering"]["samples_before"] = None
     profiler.stats["phases"]["filtering"]["samples_after"] = int(len(filtered_dataset))
     profiler.end_phase("filtering")
+
+    # SASIC: Collect activation statistics if enabled
+    activation_stats = None
+    if calibration_loader is not None and sasic_cfg.get("enabled", False) and sasic_cfg.get("mode") == "active":
+        from .activation_stats import collect_activation_stats
+        calib_start = perf_counter()
+        print("\n[SASIC] Collecting activation statistics from calibration slice...")
+        activation_stats = collect_activation_stats(
+            model=model,
+            loader=calibration_loader,
+            device=device,
+            sasic_cfg=sasic_cfg,
+            sic_cfg=cfg,
+        )
+        calib_time = perf_counter() - calib_start
+        num_batches = len(calibration_loader)
+        print(f"[SASIC] Calibration complete: {num_batches} batches, {calib_time:.2f}s")
+        if profiler:
+            profiler.stats.setdefault("sasic", {})["calibration_time_sec"] = calib_time
+            profiler.stats["sasic"]["calibration_batches"] = num_batches
 
     profiler.start_phase("clustering")
     neuron_log = LogBuffer(neuron_log_path, flush_every=log_flush_every) if enable_neuron_log else None
@@ -576,9 +597,9 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     return model, profiler.stats
 
 @torch.inference_mode()
-def SIC_hybrid(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
-    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="hybrid")
+def SIC_hybrid(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None, calibration_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="hybrid", calibration_loader=calibration_loader)
 
 @torch.inference_mode()
-def SIC(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
-    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="classic")
+def SIC(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None, calibration_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="classic", calibration_loader=calibration_loader)

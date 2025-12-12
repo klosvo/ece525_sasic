@@ -143,6 +143,28 @@ def main():
         worker_init_fn=worker_init_fn,
     )
 
+    # Build calibration loader for SASIC if enabled
+    calibration_loader = None
+    sasic_cfg = cfg.get("sasic", {}) or {}
+    if sasic_cfg.get("enabled", False) and sasic_cfg.get("mode") == "active":
+        calibration_fraction = float(sasic_cfg.get("calibration_fraction", 0.1))
+        if calibration_fraction > 0:
+            from torch.utils.data import Subset
+            # Create calibration subset from training data
+            calib_size = max(1, int(len(train_ds) * calibration_fraction))
+            # Use a fixed seed for reproducibility
+            calib_indices = torch.randperm(len(train_ds), generator=torch.Generator().manual_seed(seed))[:calib_size].tolist()
+            calib_subset = Subset(train_ds, calib_indices)
+            calibration_loader = DataLoader(
+                calib_subset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent,
+                worker_init_fn=worker_init_fn,
+            )
+
     device_eval, eval_test_loader = _make_clean_eval_loader(cfg)
 
     obj_path = io.get("custom_model_object_path")
@@ -238,6 +260,7 @@ def main():
             profiler=sic_profiler,
             cfg=cfg,
             val_loader=val_loader,
+            calibration_loader=calibration_loader,
         )
     else:
         model, _ = SIC(
@@ -248,6 +271,7 @@ def main():
             profiler=sic_profiler,
             cfg=cfg,
             val_loader=val_loader,
+            calibration_loader=calibration_loader,
         )
 
     changed_by_sic = _fingerprint(model) != fp_before
