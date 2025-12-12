@@ -99,8 +99,8 @@ prune:
 # SASIC (Sparsity-Aware SIC)
 # =========================
 sasic:
-  enabled: false
-  mode: "none"          # valid values for now: "none", "active"
+  enabled: true
+  mode: "active"          # valid values for now: "none", "active"
   calibration_fraction: 0.1
   activation_stat: "p_above"
   activation_threshold: 0.01
