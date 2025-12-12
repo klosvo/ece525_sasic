@@ -114,10 +114,38 @@ def load_sic_config() -> Dict[str, Any]:
             "custom_load_path": None,
             "custom_save_name": None,
         },
+        "sasic": {
+            "enabled": False,
+            "mode": "none",
+            "calibration_fraction": 0.1,
+            "activation_stat": "p_above",
+            "activation_threshold": 0.01,
+            "weight_exponent": 1.0,
+        },
     }
 
     file_cfg = _load_file(args.config)
     cfg = deep_update(cfg, file_cfg)
+
+    # Ensure sasic config exists and is a dict (in case it was missing or None from file)
+    if "sasic" not in cfg or not isinstance(cfg.get("sasic"), dict):
+        cfg["sasic"] = {
+            "enabled": False,
+            "mode": "none",
+            "calibration_fraction": 0.1,
+            "activation_stat": "p_above",
+            "activation_threshold": 0.01,
+            "weight_exponent": 1.0,
+        }
+
+    # Validate sasic.mode
+    sasic_cfg = cfg.get("sasic", {})
+    sasic_mode = sasic_cfg.get("mode", "none")
+    valid_modes = {"none", "active"}
+    if sasic_mode not in valid_modes:
+        raise ValueError(
+            f"Invalid sasic.mode: '{sasic_mode}'. Must be one of: {valid_modes}"
+        )
 
     if args.device:
         cfg["device"] = args.device

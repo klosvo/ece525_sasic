@@ -4,7 +4,7 @@
 # =========================
 device: auto
 dataset: MNIST
-model: LeNet5Tanh
+model: SmallMNISTCNN
 
 # =========================
 # Data & Training
@@ -94,6 +94,17 @@ prune:
   acceptance_from: "train+val"
   acceptance_max: null
   check_batch_size: 1024
+
+# =========================
+# SASIC (Sparsity-Aware SIC)
+# =========================
+sasic:
+  enabled: false
+  mode: "none"          # valid values for now: "none", "active"
+  calibration_fraction: 0.1
+  activation_stat: "p_above"
+  activation_threshold: 0.01
+  weight_exponent: 1.0
 
 # =========================
 # Verify convenience block (used by your scripts/tools)
