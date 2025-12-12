@@ -108,6 +108,17 @@ class SICProfiler:
             self.stats["global"]["memory_peak_mb"] = self.memory_tracker.get_peak_memory()
             self.stats["global"]["memory_saved_mb"] = self.memory_tracker.get_memory_saved()
             self.stats["memory_timeline"] = list(self.memory_tracker.timeline)
+        
+        # Compute final k-trials statistics (avg_k_trials_per_neuron)
+        # (sasic_design.md §9: aggregate metrics for comparing baseline vs SASIC)
+        if "sic" in self.stats:
+            sic_stats = self.stats["sic"]
+            if "total_k_trials" in sic_stats and "num_neurons_evaluated" in sic_stats:
+                total_k = sic_stats["total_k_trials"]
+                num_neurons = sic_stats["num_neurons_evaluated"]
+                if num_neurons > 0:
+                    sic_stats["avg_k_trials_per_neuron"] = float(total_k / num_neurons)
+        
         print(f"[PROFILER] Completed profiling. Total duration: {self.stats['global']['total_duration']:.2f}s")
 
     def start_phase(self, phase_name: str) -> None:

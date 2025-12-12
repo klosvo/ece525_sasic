@@ -275,34 +275,61 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         flat[idx] = orig_t
                         profiler.record_neuron_attempt(name, idx, 0, False, "zero_rejected")
 
-                    # SASIC Mode A: Check if active-subset clustering should be used
+                    # SASIC Mode A — Active-Subset SASIC (sasic_design.md §5.1)
+                    # Mode A is active for this neuron if and only if ALL of the following are true:
+                    # 1. SASIC is enabled and mode is "active"
+                    # 2. Global activation_stats exist and contain data for this layer/neuron
+                    # 3. We can build an active_mask_full with length exactly equal to len(orig_np)
+                    # 4. The active set A is "non-trivial": at least 2 active inputs AND
+                    #    active fraction is neither ~0% nor ~100% (optimization: skip if >95% active)
+                    # If any condition fails, Mode A is disabled for this neuron and we use pure baseline.
+                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
                     sasic_active = (
                         sasic_cfg.get("enabled", False)
                         and sasic_cfg.get("mode") == "active"
                         and activation_stats is not None
                     )
                     
-                    # Get active mask for this neuron if SASIC is active
                     active_mask_full = None
                     if sasic_active:
                         from .sasic_utils import get_layer_key_for_sasic, get_active_indices_for_neuron
                         layer_key = get_layer_key_for_sasic(name, module)
+                        # activation_threshold maps to tau_active in design doc (§5.1, §7.2)
                         activation_threshold = float(sasic_cfg.get("activation_threshold", 0.01))
+                        # Pass ground-truth num_inputs to ensure mask length matches weight vector
+                        # (sasic_design.md §4.3: stats must align with flattened weight indices)
                         active_mask_full = get_active_indices_for_neuron(
-                            activation_stats, layer_key, idx, activation_threshold
+                            activation_stats, layer_key, idx, activation_threshold, num_inputs=len(orig_np)
                         )
-                        # If no valid active mask, fall back to baseline
+                        
+                        # Conservative fallback conditions (sasic_design.md §10: must preserve baseline when disabled)
+                        # All checks must pass; if any fails, abort Mode A entirely for this neuron.
                         if active_mask_full is None:
+                            # Stats missing or inconsistent
                             sasic_active = False
+                            active_mask_full = None
                         elif active_mask_full.shape[0] != len(orig_np):
-                            # Shape mismatch - fallback
+                            # Hard requirement: mask length must match weight vector length
                             sasic_active = False
-                        elif not np.any(active_mask_full):
-                            # No active inputs - fallback
-                            sasic_active = False
-                        elif np.all(active_mask_full):
-                            # All inputs active - effectively baseline, but can still use SASIC path
-                            pass
+                            active_mask_full = None
+                        else:
+                            num_active = int(np.sum(active_mask_full))
+                            active_frac = float(num_active / len(orig_np)) if len(orig_np) > 0 else 0.0
+                            
+                            # Fallback if active set is too small (< 2 active inputs)
+                            # (Design doc §5.1 requires clustering on active inputs; need at least 2 for Jenks)
+                            if num_active < 2:
+                                sasic_active = False
+                                active_mask_full = None
+                            # Optimization: skip SASIC if almost all inputs are active (>95%)
+                            # This avoids overhead when Mode A provides little benefit
+                            elif active_frac > 0.95:
+                                sasic_active = False
+                                active_mask_full = None
+                            # Fallback if no active inputs (should be caught above, but double-check)
+                            elif num_active == 0:
+                                sasic_active = False
+                                active_mask_full = None
                     
                     # SASIC: Accumulate active input stats for this neuron (only on first pass)
                     if sasic_layer_active and active_mask_full is not None and active_mask_full.shape[0] == len(orig_np):
@@ -317,6 +344,10 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                             # Skip logging for this neuron if anything goes wrong
                             pass
 
+                    # Track k-trials for this neuron (for profiler stats)
+                    # Count every k evaluation regardless of accept/reject, baseline vs SASIC
+                    k_trials_this_neuron = 0
+                    
                     for k in range(1, max_k + 1):
                         if converged:
                             break
@@ -327,32 +358,51 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                 flush=True,
                             )
 
-                        # SASIC Mode A: Use active subset for clustering
+                        # Count this k evaluation (regardless of accept/reject, baseline vs SASIC)
+                        # (sasic_design.md §9: track number of k values attempted per neuron)
+                        k_trials_this_neuron += 1
+                        
+                        # SASIC Mode A clustering (sasic_design.md §5.1, step 3):
+                        # Run Jenks clustering on {w_i : i in A} (active inputs only)
+                        # Implementation note: we cluster active nonzero inputs, then handle
+                        # active zeros separately by assigning to nearest cluster center.
+                        # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
                         if sasic_active and active_mask_full is not None:
                             # Get active mask for nonzero entries
                             active_mask_nz = active_mask_full[nz]
-                            if np.sum(active_mask_nz) < 2:
-                                # Need at least 2 active nonzero values for clustering
-                                # Fall back to baseline
+                            num_active_nz = int(np.sum(active_mask_nz))
+                            
+                            # Conservative check: need at least 2 active nonzero for clustering
+                            # If this fails, abort Mode A entirely for this neuron (pure baseline)
+                            # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                            if num_active_nz < 2:
+                                # Fallback: abort Mode A, use pure baseline for this neuron
+                                # This ensures no "half SASIC, half baseline" behavior
+                                sasic_active = False
+                                active_mask_full = None
                                 breaks = _jenks_breaks(vals, k)
                             else:
-                                # Extract active nonzero values
+                                # Extract active nonzero values and run Jenks on active subset
+                                # (sasic_design.md §5.1, step 3: cluster weights of active inputs)
                                 vals_active = vals[active_mask_nz]
-                                # Run Jenks on active subset
                                 breaks = _jenks_breaks(vals_active, k)
                         else:
-                            # Baseline: run Jenks on all nonzero values
+                            # Baseline: run Jenks on all nonzero values (sasic_design.md §2)
                             breaks = _jenks_breaks(vals, k)
 
                         if use_gpu:
                             # GPU path
+                            # SASIC Mode A consolidation (sasic_design.md §5.1, steps 3-4):
+                            # - Active inputs assigned to cluster centers from Jenks
+                            # - Quiet inputs attached to nearest cluster center by weight distance
                             if sasic_active and active_mask_full is not None:
-                                # SASIC Mode A: Convert to numpy for SASIC logic, then convert back
-                                from .sasic_utils import attach_quiet_inputs_to_clusters
-                                
-                                # Get active mask for nonzero entries
+                                # Re-check active nonzero count (may have changed in k-loop)
                                 active_mask_nz = active_mask_full[nz]
-                                if np.sum(active_mask_nz) >= 2:
+                                num_active_nz = int(np.sum(active_mask_nz))
+                                
+                                if num_active_nz >= 2:
+                                    # SASIC Mode A: Convert to numpy for SASIC logic, then convert back
+                                    from .sasic_utils import attach_quiet_inputs_to_clusters
                                     # Extract active nonzero values
                                     vals_active = vals[active_mask_nz]
                                     
@@ -386,7 +436,8 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                         if len(pos) > 0:
                                             cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
                                     
-                                    # For active zero inputs, assign to nearest cluster center
+                                    # For active zero inputs, assign to nearest cluster center by distance from 0.0
+                                    # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
                                     active_zero_mask = active_mask_full & ~nz
                                     active_zero_indices = np.where(active_zero_mask)[0]
                                     for zero_idx in active_zero_indices:
@@ -397,6 +448,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                             cluster_assignments_full[pos[0]] = nearest_cluster
                                     
                                     # Build full consolidated vector using SASIC attachment
+                                    # (sasic_design.md §5.1, step 4: attach quiet inputs to nearest cluster center)
                                     new_flat_np = attach_quiet_inputs_to_clusters(
                                         weights_full=orig_np,
                                         active_mask=active_mask_full,
@@ -416,7 +468,11 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                             idxs = active_nz_indices_full[sel_mask]
                                             row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
                                 else:
-                                    # Fallback: not enough active inputs, use baseline GPU path
+                                    # Fallback: not enough active inputs, abort Mode A and use pure baseline GPU path
+                                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                                    # This ensures no "half SASIC, half baseline" behavior
+                                    sasic_active = False
+                                    active_mask_full = None
                                     v = orig_t.clone()
                                     mask = v != 0
                                     vv = v[mask]
@@ -473,13 +529,15 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                     row_pos.append((idxs_cpu, float(means_cpu[g].item())))
                         else:
                             # CPU path
+                            # SASIC Mode A consolidation (sasic_design.md §5.1, steps 3-4)
                             if sasic_active and active_mask_full is not None:
-                                # SASIC Mode A: Cluster active inputs, attach quiet inputs
-                                from .sasic_utils import attach_quiet_inputs_to_clusters
-                                
-                                # Get active mask for nonzero entries
+                                # Re-check active nonzero count (may have changed in k-loop)
                                 active_mask_nz = active_mask_full[nz]
-                                if np.sum(active_mask_nz) >= 2:
+                                num_active_nz = int(np.sum(active_mask_nz))
+                                
+                                if num_active_nz >= 2:
+                                    # SASIC Mode A: Cluster active inputs, attach quiet inputs
+                                    from .sasic_utils import attach_quiet_inputs_to_clusters
                                     # Extract active nonzero values
                                     vals_active = vals[active_mask_nz]
                                     
@@ -518,18 +576,19 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                         if len(pos) > 0:
                                             cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
                                     
-                                    # For active zero inputs, assign to nearest cluster center
+                                    # For active zero inputs, assign to nearest cluster center by distance from 0.0
+                                    # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
                                     active_zero_mask = active_mask_full & ~nz
                                     active_zero_indices = np.where(active_zero_mask)[0]
                                     for zero_idx in active_zero_indices:
                                         pos = np.where(active_indices_full == zero_idx)[0]
                                         if len(pos) > 0:
-                                            # Assign to nearest cluster center (distance from 0.0)
                                             distances = np.abs(cluster_centers - 0.0)
                                             nearest_cluster = int(np.argmin(distances))
                                             cluster_assignments_full[pos[0]] = nearest_cluster
                                     
                                     # Build full consolidated vector using SASIC attachment
+                                    # (sasic_design.md §5.1, step 4: attach quiet inputs to nearest cluster center)
                                     new_flat = attach_quiet_inputs_to_clusters(
                                         weights_full=orig_np,
                                         active_mask=active_mask_full,
@@ -545,7 +604,11 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                             idxs = active_nz_indices_full[sel_mask]
                                             row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
                                 else:
-                                    # Fallback: not enough active inputs, use baseline
+                                    # Fallback: not enough active inputs, abort Mode A and use pure baseline
+                                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                                    # This ensures no "half SASIC, half baseline" behavior
+                                    sasic_active = False
+                                    active_mask_full = None
                                     new_flat = orig_np.copy()
                                     row_pos = []
                                     for i_c in range(len(breaks) - 1):
@@ -601,6 +664,26 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     if not converged:
                         profiler.record_neuron_attempt(name, idx, max_k, False, "max_clusters_exceeded")
                         no_change[idx] = no_change[idx] + 1
+                    
+                    # Record k-trials for this neuron (for profiler stats)
+                    # Track both per-layer and global totals (sasic_design.md §9: metrics and logging)
+                    if name not in profiler.stats["layers"]:
+                        profiler.stats["layers"][name] = {}
+                    layer_stats = profiler.stats["layers"][name]
+                    if "k_trials_list" not in layer_stats:
+                        layer_stats["k_trials_list"] = []
+                    layer_stats["k_trials_list"].append(k_trials_this_neuron)
+                    
+                    # Initialize global k-trials counters if needed
+                    if "sic" not in profiler.stats:
+                        profiler.stats["sic"] = {}
+                    if "total_k_trials" not in profiler.stats["sic"]:
+                        profiler.stats["sic"]["total_k_trials"] = 0
+                    if "num_neurons_evaluated" not in profiler.stats["sic"]:
+                        profiler.stats["sic"]["num_neurons_evaluated"] = 0
+                    
+                    profiler.stats["sic"]["total_k_trials"] += k_trials_this_neuron
+                    profiler.stats["sic"]["num_neurons_evaluated"] += 1
 
                 with torch.no_grad():
                     module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
@@ -625,6 +708,15 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     except Exception:
                         # Skip logging for this layer if anything goes wrong
                         pass
+                
+                # Compute per-layer k-trials statistics (sasic_design.md §9: per-layer metrics)
+                if name in profiler.stats["layers"]:
+                    layer_stats = profiler.stats["layers"][name]
+                    if "k_trials_list" in layer_stats and layer_stats["k_trials_list"]:
+                        k_trials_list = layer_stats["k_trials_list"]
+                        layer_stats["avg_k_trials_per_neuron"] = float(np.mean(k_trials_list))
+                        layer_stats["total_k_trials"] = int(sum(k_trials_list))
+                        # Keep list for detailed analysis, but also store aggregate
                 
                 if autosave_each and autosave_path:
                     profiler.save_detailed_stats(autosave_path)

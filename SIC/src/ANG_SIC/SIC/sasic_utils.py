@@ -3,6 +3,8 @@ SASIC Mode A (Active-Subset) Utility Functions
 
 Helper functions for implementing Active-Subset SASIC in the SIC clustering pipeline.
 These functions support Mode A only (not Weighted or Hybrid modes).
+
+See sasic_design.md §5.1 (Mode A — Active-Subset SASIC) for the specification.
 """
 
 from typing import Optional, Dict, Any
@@ -35,19 +37,26 @@ def get_active_indices_for_neuron(
     layer_key: str,
     neuron_idx: int,
     threshold: float,
+    num_inputs: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """
     Get active input indices for a specific neuron based on activation statistics.
+    
+    Implements Mode A active set definition: A = { i : a_i >= threshold }.
+    See sasic_design.md §5.1 for specification.
     
     Args:
         activation_stats: Nested dict from collect_activation_stats:
             activation_stats[layer_key][neuron_idx][input_idx] = a_i
         layer_key: Layer identifier (from get_layer_key_for_sasic).
         neuron_idx: Neuron index (row index in flattened weight matrix).
-        threshold: Activation threshold (a_i >= threshold means active).
+        threshold: Activation threshold (tau_active in design doc; a_i >= threshold means active).
+        num_inputs: Optional ground-truth number of inputs (from weight vector length).
+            If provided, mask will be exactly this length. Missing indices in stats
+            are treated as quiet (False). If None, infers from max(input_idx) + 1.
     
     Returns:
-        Boolean mask array (1D numpy array) of same length as number of inputs,
+        Boolean mask array (1D numpy array) of length num_inputs (or inferred),
         where True indicates active inputs (a_i >= threshold).
         Returns None if:
         - activation_stats is None
@@ -70,19 +79,36 @@ def get_active_indices_for_neuron(
     if not neuron_stats:
         return None
     
-    # Get number of inputs (max input_idx + 1, or infer from stats)
-    max_input_idx = max(neuron_stats.keys()) if neuron_stats else -1
-    if max_input_idx < 0:
-        return None
-    
-    num_inputs = max_input_idx + 1
+    # Determine mask length: use ground truth if provided, otherwise infer
+    # (sasic_design.md §4.3: stats must align with flattened weight indices)
+    # Always prefer ground-truth num_inputs to avoid mask length mismatches
+    if num_inputs is not None:
+        mask_len = int(num_inputs)
+        # Validate: stats should not contain indices >= num_inputs
+        max_idx_in_stats = max(neuron_stats.keys()) if neuron_stats else -1
+        if max_idx_in_stats >= mask_len:
+            # Inconsistent: stats have indices beyond expected length
+            return None
+    else:
+        # Infer from stats (legacy behavior, less reliable)
+        # Caller should always provide num_inputs for Mode A
+        max_input_idx = max(neuron_stats.keys()) if neuron_stats else -1
+        if max_input_idx < 0:
+            return None
+        mask_len = max_input_idx + 1
     
     # Build boolean mask: True where a_i >= threshold
-    active_mask = np.zeros(num_inputs, dtype=bool)
+    # Missing indices in stats are treated as quiet (False)
+    # (sasic_design.md §5.1: A = { i : a_i >= threshold })
+    active_mask = np.zeros(mask_len, dtype=bool)
     for input_idx, a_i in neuron_stats.items():
+        input_idx_int = int(input_idx)
+        if input_idx_int >= mask_len:
+            # Out of bounds - skip this entry
+            continue
         if isinstance(a_i, (int, float)) and not np.isnan(a_i):
             if a_i >= threshold:
-                active_mask[int(input_idx)] = True
+                active_mask[input_idx_int] = True
     
     # Check if all are invalid/NaN
     if not np.any(active_mask) and not np.any(~active_mask):
@@ -101,9 +127,10 @@ def attach_quiet_inputs_to_clusters(
     """
     Attach quiet inputs to nearest cluster centers by weight distance.
     
-    This implements Mode A's quiet input attachment step:
+    Implements Mode A quiet input attachment (sasic_design.md §5.1, step 4):
     - Active inputs are already assigned to clusters (via cluster_assignments).
-    - Quiet inputs are assigned to the nearest cluster center by absolute weight distance.
+    - Quiet inputs (j not in A) are attached to nearest cluster center by weight distance:
+      j -> argmin_c |w_j - mu_c|
     
     Args:
         weights_full: 1D numpy array of original input weights for this neuron

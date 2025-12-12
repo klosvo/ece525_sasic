@@ -7,6 +7,13 @@ Sparsity-Aware Synaptic Input Consolidation (SASIC) Mode A (Active-Subset).
 The module performs training-free forward passes on a small subset of data to
 compute per-input activation indicators, which are then used to identify
 active vs. quiet inputs during clustering.
+
+See sasic_design.md §4 (Activation Statistics) and §8.3 (Activation Pass) for
+the specification. Current implementation uses nested dict storage; design doc
+§4.3 describes a future tensor-based interface.
+
+TODO: Enforce strict class-balance in calibration slice (design doc §4.1).
+      Currently uses random subset via calibration_fraction.
 """
 
 from typing import Dict, Any, Optional, List, Tuple
@@ -95,8 +102,12 @@ def collect_activation_stats(
         return {}
 
     # Get configuration
+    # activation_stat: "p_above" ≈ nzrate, "mean_abs" = mean absolute activation
+    # activation_threshold: maps to tau_active in design doc (§5.1, §7.2), threshold for "p_above" mode
     activation_stat = str(sasic_cfg.get("activation_stat", "p_above"))
     activation_threshold = float(sasic_cfg.get("activation_threshold", 0.01))
+    # weight_exponent: reserved for future weighted modes (gamma in design doc §4.2, §7.2), not used in Mode A
+    _weight_exponent = float(sasic_cfg.get("weight_exponent", 1.0))  # Not used in Mode A
     
     if activation_stat not in {"p_above", "mean_abs"}:
         raise ValueError(
