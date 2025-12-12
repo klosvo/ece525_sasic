@@ -127,6 +127,9 @@ def load_sic_config() -> Dict[str, Any]:
     file_cfg = _load_file(args.config)
     cfg = deep_update(cfg, file_cfg)
 
+    # Add config_name to cfg
+    cfg["config_name"] = os.path.basename(args.config) if args.config else "unknown_config.yaml"
+
     # Ensure sasic config exists and is a dict (in case it was missing or None from file)
     if "sasic" not in cfg or not isinstance(cfg.get("sasic"), dict):
         cfg["sasic"] = {

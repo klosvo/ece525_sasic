@@ -6,6 +6,7 @@ import torch
 import pandas as pd
 import dill
 import importlib.util
+from datetime import datetime
 from torch.utils.data import DataLoader
 from typing import Dict, Any, Tuple
 
@@ -192,34 +193,115 @@ def main():
 
     if weights_path_cfg:
         base_model_name = os.path.basename(resolve_in_dir(weights_path_cfg, models_dir))
-    save_path = (
-        resolve_in_dir(io.get("custom_save_name"), models_dir)
-        if io.get("custom_save_name")
-        else os.path.join(models_dir, f"SIC_{base_model_name}")
-    )
-
-    sic_base = os.path.splitext(os.path.basename(save_path))[0]
-    excel_path = build_output_path(io.get("excel_path"), profiling_dir, f"{sic_base}.xlsx")
+    
+    # Derive config_tag from config_name
+    config_name = cfg.get("config_name", "unknown_config.yaml")
+    if config_name == "sic.yaml":
+        config_tag = "main"
+    elif config_name == "sic_dev.yaml":
+        config_tag = "dev"
+    elif config_name == "sic_smoke.yaml":
+        config_tag = "smoke"
+    else:
+        config_tag = "other"
+    
+    # Update output directories to include config_tag
+    models_dir = os.path.join(models_dir, config_tag)
+    profiling_dir = os.path.join(profiling_dir, config_tag)
+    cfg["io"]["models_dir"] = models_dir
+    cfg["io"]["profiling_dir"] = profiling_dir
+    ensure_parent_dir(models_dir + "/")
+    ensure_parent_dir(profiling_dir + "/")
+    
+    # Construct human-readable timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
+    
+    # Determine run mode label
+    sasic_cfg = cfg.get("sasic", {}) or {}
+    sasic_enabled = sasic_cfg.get("enabled", False)
+    sasic_mode = sasic_cfg.get("mode", "none")
+    
+    if not sasic_enabled or sasic_mode == "none":
+        run_mode_label = "baseline"
+    elif sasic_enabled and sasic_mode == "active":
+        run_mode_label = "SASIC"
+    elif sasic_mode == "weighted":
+        run_mode_label = "SASIC_Weighted"
+    elif sasic_mode == "hybrid":
+        run_mode_label = "SASIC_Hybrid"
+    else:
+        raise ValueError(
+            f"Invalid SASIC configuration: enabled={sasic_enabled}, mode={sasic_mode}. "
+            f"Mode must be one of: 'none', 'active', 'weighted', 'hybrid'"
+        )
+    
+    # Build unified run prefix
+    model_name = cfg.get("model", "UnknownModel")
+    dataset_name = cfg.get("dataset", "UnknownDataset")
+    run_prefix = f"{model_name}_{dataset_name}_{run_mode_label}_{timestamp}"
+    
+    # Build model weights filename (support custom_save_name)
+    custom_save_name = io.get("custom_save_name")
+    if custom_save_name:
+        base, ext = os.path.splitext(os.path.basename(custom_save_name))
+        if not ext:
+            ext = ".pth"
+        save_filename = f"{base}_{timestamp}{ext}"
+    else:
+        save_filename = f"{run_prefix}.pth"
+    
+    save_path = os.path.join(models_dir, save_filename)
+    
     enable_json = bool(io.get("enable_json_stats", True))
     enable_log = bool(io.get("enable_neuron_log", True))
     enable_auto = bool(io.get("enable_autosave_progress", True))
+    
     json_path = (
-        build_output_path(io.get("json_stats_path"), profiling_dir, f"{sic_base}_detailed_stats.json")
+        build_output_path(
+            io.get("json_stats_path"),
+            profiling_dir,
+            f"{run_prefix}_stats.json",
+        )
         if enable_json
         else None
     )
-    neuron_log_path = build_output_path(
-        io.get("neuron_log_path", os.path.join(profiling_dir, "SIC_per_neuron_times.jsonl")),
-        profiling_dir,
-        "SIC_per_neuron_times.jsonl",
-    ) if enable_log else None
-    autosave_progress_path = build_output_path(
-        io.get("autosave_progress_path", os.path.join(profiling_dir, "SIC_Progress_Autosave.json")),
-        profiling_dir,
-        "SIC_Progress_Autosave.json",
-    ) if enable_auto else None
+    
+    neuron_log_path = (
+        build_output_path(
+            io.get("neuron_log_path", os.path.join(profiling_dir, "SIC_per_neuron_times.jsonl")),
+            profiling_dir,
+            f"{run_prefix}_neurons.jsonl",
+        )
+        if enable_log
+        else None
+    )
+    
+    autosave_progress_path = (
+        build_output_path(
+            io.get("autosave_progress_path", os.path.join(profiling_dir, "SIC_Progress_Autosave.json")),
+            profiling_dir,
+            f"{run_prefix}_progress.json",
+        )
+        if enable_auto
+        else None
+    )
+    
+    excel_path = build_output_path(io.get("excel_path"), profiling_dir, f"{run_prefix}.xlsx")
+    
     cfg["io"]["neuron_log_path"] = neuron_log_path
     cfg["io"]["autosave_progress_path"] = autosave_progress_path
+    
+    # Print run_prefix and resulting filenames
+    print(f"\n[RUN] Run prefix: {run_prefix}")
+    print(f"[RUN] Model weights: {save_path}")
+    if json_path:
+        print(f"[RUN] JSON stats: {json_path}")
+    if neuron_log_path:
+        print(f"[RUN] Neuron logs: {neuron_log_path}")
+    if autosave_progress_path:
+        print(f"[RUN] Autosave progress: {autosave_progress_path}")
+    if bool(cfg["io"].get("write_full_weights_to_excel", False)):
+        print(f"[RUN] Excel report: {excel_path}")
 
     print("\nINITIAL MODEL ANALYSIS")
     pre_profiler = SICProfiler()
@@ -327,7 +409,7 @@ def main():
 
     ensure_parent_dir(save_path)
     torch.save(model.state_dict(), save_path)
-    print(f"[SIC] Weights saved: {save_path}")
+    print(f"[SIC] Model weights saved: {save_path}")
 
     print("\nFINAL MODEL ANALYSIS")
     final_profiler = SICProfiler()
@@ -347,7 +429,9 @@ def main():
         print(f"[EVAL] Val  (final): {final_val_acc:.2f}%")
 
     if json_path:
+        ensure_parent_dir(json_path)
         final_profiler.save_detailed_stats(json_path)
+        print(f"[SIC] Profiler JSON saved: {json_path}")
 
     if bool(cfg["io"].get("write_full_weights_to_excel", False)):
         ensure_parent_dir(excel_path)

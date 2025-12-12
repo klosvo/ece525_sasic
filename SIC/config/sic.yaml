@@ -105,7 +105,7 @@ sasic:
   weight_exponent: 1.0
 
 # =========================
-# Verify convenience block (used by your scripts/tools)
+# Verify convenience block (used by scripts/tools)
 # =========================
 verify:
   rounding_decimals: 32
