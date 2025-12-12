@@ -214,6 +214,21 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                 best_flat = flat.clone()
                 success_count_this_layer = 0
                 num_neurons = flat.size(0)
+                
+                # SASIC: Initialize per-layer active input stats accumulation (only on first pass)
+                sasic_layer_active = (
+                    pass_idx == 0
+                    and sasic_cfg.get("enabled", False)
+                    and sasic_cfg.get("mode") == "active"
+                    and activation_stats is not None
+                )
+                sasic_layer_stats = None
+                if sasic_layer_active:
+                    sasic_layer_stats = {
+                        "num_inputs_list": [],
+                        "num_active_list": [],
+                        "active_frac_list": [],
+                    }
                 pos_clusters_for_layer = getattr(module, "_sic_pos_clusters", [[] for _ in range(num_neurons)])
                 if len(pos_clusters_for_layer) != num_neurons:
                     pos_clusters_for_layer = [[] for _ in range(num_neurons)]
@@ -287,6 +302,19 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                             sasic_active = False
                         elif np.all(active_mask_full):
                             # All inputs active - effectively baseline, but can still use SASIC path
+                            pass
+                    
+                    # SASIC: Accumulate active input stats for this neuron (only on first pass)
+                    if sasic_layer_active and active_mask_full is not None and active_mask_full.shape[0] == len(orig_np):
+                        try:
+                            num_inputs = len(orig_np)
+                            num_active = int(np.sum(active_mask_full))
+                            active_frac = float(num_active / num_inputs) if num_inputs > 0 else 0.0
+                            sasic_layer_stats["num_inputs_list"].append(num_inputs)
+                            sasic_layer_stats["num_active_list"].append(num_active)
+                            sasic_layer_stats["active_frac_list"].append(active_frac)
+                        except Exception:
+                            # Skip logging for this neuron if anything goes wrong
                             pass
 
                     for k in range(1, max_k + 1):
@@ -578,6 +606,26 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
                 setattr(module, "_sic_pos_clusters", pos_clusters_for_layer)
                 setattr(module, "_sic_no_change", no_change)
+                
+                # SASIC: Store per-layer active input stats in profiler (only on first pass)
+                if sasic_layer_active and sasic_layer_stats is not None:
+                    try:
+                        if sasic_layer_stats["num_inputs_list"]:
+                            from .sasic_utils import get_layer_key_for_sasic
+                            layer_key = get_layer_key_for_sasic(name, module)
+                            num_inputs = sasic_layer_stats["num_inputs_list"][0]  # Should be same for all neurons
+                            avg_active = float(np.mean(sasic_layer_stats["num_active_list"]))
+                            avg_active_frac = float(np.mean(sasic_layer_stats["active_frac_list"]))
+                            
+                            profiler.stats.setdefault("sasic", {}).setdefault("layers", {})[layer_key] = {
+                                "num_inputs": int(num_inputs),
+                                "avg_active": avg_active,
+                                "avg_active_frac": avg_active_frac,
+                            }
+                    except Exception:
+                        # Skip logging for this layer if anything goes wrong
+                        pass
+                
                 if autosave_each and autosave_path:
                     profiler.save_detailed_stats(autosave_path)
                 profiler.record_layer_processing(name, perf_counter() - layer_t0, success_count_this_layer, num_neurons)
