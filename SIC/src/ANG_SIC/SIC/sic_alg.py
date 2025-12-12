@@ -260,6 +260,35 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         flat[idx] = orig_t
                         profiler.record_neuron_attempt(name, idx, 0, False, "zero_rejected")
 
+                    # SASIC Mode A: Check if active-subset clustering should be used
+                    sasic_active = (
+                        sasic_cfg.get("enabled", False)
+                        and sasic_cfg.get("mode") == "active"
+                        and activation_stats is not None
+                    )
+                    
+                    # Get active mask for this neuron if SASIC is active
+                    active_mask_full = None
+                    if sasic_active:
+                        from .sasic_utils import get_layer_key_for_sasic, get_active_indices_for_neuron
+                        layer_key = get_layer_key_for_sasic(name, module)
+                        activation_threshold = float(sasic_cfg.get("activation_threshold", 0.01))
+                        active_mask_full = get_active_indices_for_neuron(
+                            activation_stats, layer_key, idx, activation_threshold
+                        )
+                        # If no valid active mask, fall back to baseline
+                        if active_mask_full is None:
+                            sasic_active = False
+                        elif active_mask_full.shape[0] != len(orig_np):
+                            # Shape mismatch - fallback
+                            sasic_active = False
+                        elif not np.any(active_mask_full):
+                            # No active inputs - fallback
+                            sasic_active = False
+                        elif np.all(active_mask_full):
+                            # All inputs active - effectively baseline, but can still use SASIC path
+                            pass
+
                     for k in range(1, max_k + 1):
                         if converged:
                             break
@@ -270,51 +299,258 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                 flush=True,
                             )
 
-                        breaks = _jenks_breaks(vals, k)
+                        # SASIC Mode A: Use active subset for clustering
+                        if sasic_active and active_mask_full is not None:
+                            # Get active mask for nonzero entries
+                            active_mask_nz = active_mask_full[nz]
+                            if np.sum(active_mask_nz) < 2:
+                                # Need at least 2 active nonzero values for clustering
+                                # Fall back to baseline
+                                breaks = _jenks_breaks(vals, k)
+                            else:
+                                # Extract active nonzero values
+                                vals_active = vals[active_mask_nz]
+                                # Run Jenks on active subset
+                                breaks = _jenks_breaks(vals_active, k)
+                        else:
+                            # Baseline: run Jenks on all nonzero values
+                            breaks = _jenks_breaks(vals, k)
 
                         if use_gpu:
-                            v = orig_t.clone()
-                            mask = v != 0
-                            vv = v[mask]
-                            b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
-                            bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
-                            G = b.numel() - 1
-                            means = torch.zeros(G, device=v.device, dtype=v.dtype)
-                            counts = torch.zeros_like(means)
-                            means.index_add_(0, bin_ids, vv)
-                            counts.index_add_(0, bin_ids, torch.ones_like(vv))
-                            counts = torch.where(counts == 0, torch.ones_like(counts), counts)
-                            means = means / counts
-                            vv_repl = means[bin_ids]
-                            trial_t = orig_t.clone()
-                            trial_t[mask] = vv_repl
-                            flat[idx] = trial_t
-                            row_pos: List[Tuple[torch.Tensor, float]] = []
-                            sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
-                            bin_ids_cpu = bin_ids.detach().cpu()
-                            means_cpu = means.detach().cpu()
-                            for g in range(G):
-                                g_mask = (bin_ids_cpu == g)
-                                if int(g_mask.sum().item()) == 0:
-                                    continue
-                                idxs_cpu = sel_idx[g_mask]
-                                row_pos.append((idxs_cpu, float(means_cpu[g].item())))
-                        else:
-                            new_flat = orig_np.copy()
-                            row_pos = []
-                            for i_c in range(len(breaks) - 1):
-                                lo, hi = breaks[i_c], breaks[i_c + 1]
-                                if i_c == 0:
-                                    sel = (orig_np >= lo) & (orig_np <= hi) & nz
-                                    group = vals[(vals >= lo) & (vals <= hi)]
+                            # GPU path
+                            if sasic_active and active_mask_full is not None:
+                                # SASIC Mode A: Convert to numpy for SASIC logic, then convert back
+                                from .sasic_utils import attach_quiet_inputs_to_clusters
+                                
+                                # Get active mask for nonzero entries
+                                active_mask_nz = active_mask_full[nz]
+                                if np.sum(active_mask_nz) >= 2:
+                                    # Extract active nonzero values
+                                    vals_active = vals[active_mask_nz]
+                                    
+                                    # Get indices of active nonzero inputs in the full vector
+                                    active_nz_indices_full = np.where(active_mask_full & nz)[0]
+                                    
+                                    # Compute cluster centers and assignments for active inputs
+                                    cluster_centers = np.zeros(len(breaks) - 1)
+                                    cluster_assignments_active = np.zeros(len(vals_active), dtype=np.int32)
+                                    
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel_active = (vals_active >= lo) & (vals_active <= hi)
+                                        else:
+                                            sel_active = (vals_active > lo) & (vals_active <= hi)
+                                        
+                                        if np.any(sel_active):
+                                            group = vals_active[sel_active]
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            cluster_centers[i_c] = avg
+                                            cluster_assignments_active[sel_active] = i_c
+                                    
+                                    # Build cluster assignments for all active inputs
+                                    active_indices_full = np.where(active_mask_full)[0]
+                                    cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
+                                    
+                                    # Map assignments from active nonzero to active full
+                                    for i, nz_idx in enumerate(active_nz_indices_full):
+                                        pos = np.where(active_indices_full == nz_idx)[0]
+                                        if len(pos) > 0:
+                                            cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
+                                    
+                                    # For active zero inputs, assign to nearest cluster center
+                                    active_zero_mask = active_mask_full & ~nz
+                                    active_zero_indices = np.where(active_zero_mask)[0]
+                                    for zero_idx in active_zero_indices:
+                                        pos = np.where(active_indices_full == zero_idx)[0]
+                                        if len(pos) > 0:
+                                            distances = np.abs(cluster_centers - 0.0)
+                                            nearest_cluster = int(np.argmin(distances))
+                                            cluster_assignments_full[pos[0]] = nearest_cluster
+                                    
+                                    # Build full consolidated vector using SASIC attachment
+                                    new_flat_np = attach_quiet_inputs_to_clusters(
+                                        weights_full=orig_np,
+                                        active_mask=active_mask_full,
+                                        cluster_centers=cluster_centers,
+                                        cluster_assignments=cluster_assignments_full,
+                                    )
+                                    
+                                    # Convert back to torch tensor
+                                    trial_t = torch.from_numpy(new_flat_np).to(orig_t.device, dtype=module.weight.dtype)
+                                    flat[idx] = trial_t
+                                    
+                                    # Build row_pos for PoS
+                                    row_pos: List[Tuple[torch.Tensor, float]] = []
+                                    for i_c in range(len(breaks) - 1):
+                                        sel_mask = (cluster_assignments_active == i_c)
+                                        if np.any(sel_mask):
+                                            idxs = active_nz_indices_full[sel_mask]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
                                 else:
-                                    sel = (orig_np > lo) & (orig_np <= hi) & nz
-                                    group = vals[(vals > lo) & (vals <= hi)]
-                                if np.any(sel):
-                                    avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
-                                    new_flat[sel] = avg
-                                    idxs = np.where(sel)[0]
-                                    row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                                    # Fallback: not enough active inputs, use baseline GPU path
+                                    v = orig_t.clone()
+                                    mask = v != 0
+                                    vv = v[mask]
+                                    b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                                    bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
+                                    G = b.numel() - 1
+                                    means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                                    counts = torch.zeros_like(means)
+                                    means.index_add_(0, bin_ids, vv)
+                                    counts.index_add_(0, bin_ids, torch.ones_like(vv))
+                                    counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                                    means = means / counts
+                                    vv_repl = means[bin_ids]
+                                    trial_t = orig_t.clone()
+                                    trial_t[mask] = vv_repl
+                                    flat[idx] = trial_t
+                                    row_pos: List[Tuple[torch.Tensor, float]] = []
+                                    sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
+                                    bin_ids_cpu = bin_ids.detach().cpu()
+                                    means_cpu = means.detach().cpu()
+                                    for g in range(G):
+                                        g_mask = (bin_ids_cpu == g)
+                                        if int(g_mask.sum().item()) == 0:
+                                            continue
+                                        idxs_cpu = sel_idx[g_mask]
+                                        row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                            else:
+                                # Baseline GPU path
+                                v = orig_t.clone()
+                                mask = v != 0
+                                vv = v[mask]
+                                b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                                bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
+                                G = b.numel() - 1
+                                means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                                counts = torch.zeros_like(means)
+                                means.index_add_(0, bin_ids, vv)
+                                counts.index_add_(0, bin_ids, torch.ones_like(vv))
+                                counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                                means = means / counts
+                                vv_repl = means[bin_ids]
+                                trial_t = orig_t.clone()
+                                trial_t[mask] = vv_repl
+                                flat[idx] = trial_t
+                                row_pos: List[Tuple[torch.Tensor, float]] = []
+                                sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
+                                bin_ids_cpu = bin_ids.detach().cpu()
+                                means_cpu = means.detach().cpu()
+                                for g in range(G):
+                                    g_mask = (bin_ids_cpu == g)
+                                    if int(g_mask.sum().item()) == 0:
+                                        continue
+                                    idxs_cpu = sel_idx[g_mask]
+                                    row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                        else:
+                            # CPU path
+                            if sasic_active and active_mask_full is not None:
+                                # SASIC Mode A: Cluster active inputs, attach quiet inputs
+                                from .sasic_utils import attach_quiet_inputs_to_clusters
+                                
+                                # Get active mask for nonzero entries
+                                active_mask_nz = active_mask_full[nz]
+                                if np.sum(active_mask_nz) >= 2:
+                                    # Extract active nonzero values
+                                    vals_active = vals[active_mask_nz]
+                                    
+                                    # Get indices of active nonzero inputs in the full vector
+                                    active_nz_indices_full = np.where(active_mask_full & nz)[0]
+                                    
+                                    # Compute cluster centers and assignments for active inputs
+                                    cluster_centers = np.zeros(len(breaks) - 1)
+                                    cluster_assignments_active = np.zeros(len(vals_active), dtype=np.int32)
+                                    
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel_active = (vals_active >= lo) & (vals_active <= hi)
+                                        else:
+                                            sel_active = (vals_active > lo) & (vals_active <= hi)
+                                        
+                                        if np.any(sel_active):
+                                            group = vals_active[sel_active]
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            cluster_centers[i_c] = avg
+                                            cluster_assignments_active[sel_active] = i_c
+                                    
+                                    # Build cluster assignments for all active inputs (nonzero only, since we clustered nonzero)
+                                    # active_nz_indices_full contains the full vector indices of active nonzero inputs
+                                    # cluster_assignments_active[i] is the cluster for the i-th active nonzero value
+                                    # We need cluster_assignments_full where cluster_assignments_full[j] is the cluster
+                                    # for the j-th active input in the full vector
+                                    
+                                    active_indices_full = np.where(active_mask_full)[0]
+                                    cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
+                                    
+                                    # Create mapping: for each active nonzero input, find its position in active_indices_full
+                                    for i, nz_idx in enumerate(active_nz_indices_full):
+                                        pos = np.where(active_indices_full == nz_idx)[0]
+                                        if len(pos) > 0:
+                                            cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
+                                    
+                                    # For active zero inputs, assign to nearest cluster center
+                                    active_zero_mask = active_mask_full & ~nz
+                                    active_zero_indices = np.where(active_zero_mask)[0]
+                                    for zero_idx in active_zero_indices:
+                                        pos = np.where(active_indices_full == zero_idx)[0]
+                                        if len(pos) > 0:
+                                            # Assign to nearest cluster center (distance from 0.0)
+                                            distances = np.abs(cluster_centers - 0.0)
+                                            nearest_cluster = int(np.argmin(distances))
+                                            cluster_assignments_full[pos[0]] = nearest_cluster
+                                    
+                                    # Build full consolidated vector using SASIC attachment
+                                    new_flat = attach_quiet_inputs_to_clusters(
+                                        weights_full=orig_np,
+                                        active_mask=active_mask_full,
+                                        cluster_centers=cluster_centers,
+                                        cluster_assignments=cluster_assignments_full,
+                                    )
+                                    
+                                    # Build row_pos for PoS (only active inputs that were clustered)
+                                    row_pos = []
+                                    for i_c in range(len(breaks) - 1):
+                                        sel_mask = (cluster_assignments_active == i_c)
+                                        if np.any(sel_mask):
+                                            idxs = active_nz_indices_full[sel_mask]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
+                                else:
+                                    # Fallback: not enough active inputs, use baseline
+                                    new_flat = orig_np.copy()
+                                    row_pos = []
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel = (orig_np >= lo) & (orig_np <= hi) & nz
+                                            group = vals[(vals >= lo) & (vals <= hi)]
+                                        else:
+                                            sel = (orig_np > lo) & (orig_np <= hi) & nz
+                                            group = vals[(vals > lo) & (vals <= hi)]
+                                        if np.any(sel):
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            new_flat[sel] = avg
+                                            idxs = np.where(sel)[0]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            else:
+                                # Baseline: standard consolidation
+                                new_flat = orig_np.copy()
+                                row_pos = []
+                                for i_c in range(len(breaks) - 1):
+                                    lo, hi = breaks[i_c], breaks[i_c + 1]
+                                    if i_c == 0:
+                                        sel = (orig_np >= lo) & (orig_np <= hi) & nz
+                                        group = vals[(vals >= lo) & (vals <= hi)]
+                                    else:
+                                        sel = (orig_np > lo) & (orig_np <= hi) & nz
+                                        group = vals[(vals > lo) & (vals <= hi)]
+                                    if np.any(sel):
+                                        avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                        new_flat[sel] = avg
+                                        idxs = np.where(sel)[0]
+                                        row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            
                             trial_t = torch.from_numpy(new_flat).to(orig_t.device, dtype=module.weight.dtype)
                             flat[idx] = trial_t
 
