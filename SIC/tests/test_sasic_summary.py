@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for summarize_sasic.py
+Unit tests for summarize_sic.py
 
 Tests that the summarizer:
 - Runs without crashing
@@ -16,7 +16,7 @@ import sys
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from summarize_sasic import (
+from summarize_sic import (
     load_json,
     generate_console_summary,
     generate_markdown_summary,

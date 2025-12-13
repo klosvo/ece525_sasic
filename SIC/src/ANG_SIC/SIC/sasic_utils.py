@@ -123,6 +123,7 @@ def attach_quiet_inputs_to_clusters(
     active_mask: np.ndarray,
     cluster_centers: np.ndarray,
     cluster_assignments: np.ndarray,
+    vectorized: bool = True,
 ) -> np.ndarray:
     """
     Attach quiet inputs to nearest cluster centers by weight distance.
@@ -142,6 +143,8 @@ def attach_quiet_inputs_to_clusters(
         cluster_assignments: 1D numpy array of cluster indices for active inputs only.
             Length should equal np.sum(active_mask).
             cluster_assignments[i] is the cluster index for the i-th active input.
+        vectorized: If True (default), use vectorized distance computation for quiet inputs.
+            If False, use the original loop-based implementation.
     
     Returns:
         1D numpy array of same length as weights_full, containing consolidated values:
@@ -170,11 +173,26 @@ def attach_quiet_inputs_to_clusters(
     
     # Attach quiet inputs to nearest cluster center
     quiet_indices = np.where(~active_mask)[0]
-    for input_idx in quiet_indices:
-        w_quiet = weights_full[input_idx]
-        # Find nearest cluster center by absolute distance
-        distances = np.abs(cluster_centers - w_quiet)
-        nearest_cluster = int(np.argmin(distances))
-        consolidated[input_idx] = cluster_centers[nearest_cluster]
+    if len(quiet_indices) == 0:
+        return consolidated
+    
+    if vectorized:
+        # Vectorized: compute all distances at once
+        # Shape: (num_quiet, num_clusters) - distance from each quiet weight to each cluster center
+        quiet_weights = weights_full[quiet_indices]
+        # Broadcasting: quiet_weights[:, None] - cluster_centers[None, :]
+        # Results in (num_quiet, num_clusters) matrix of distances
+        distances = np.abs(quiet_weights[:, None] - cluster_centers[None, :])
+        # Find nearest cluster for each quiet input (argmin along cluster axis)
+        nearest_clusters = np.argmin(distances, axis=1)
+        # Assign cluster centers to quiet inputs
+        consolidated[quiet_indices] = cluster_centers[nearest_clusters]
+    else:
+        # Original loop-based implementation (for compatibility/testing)
+        for input_idx in quiet_indices:
+            w_quiet = weights_full[input_idx]
+            distances = np.abs(cluster_centers - w_quiet)
+            nearest_cluster = int(np.argmin(distances))
+            consolidated[input_idx] = cluster_centers[nearest_cluster]
     
     return consolidated

@@ -150,24 +150,30 @@ class SICProfiler:
             "zero_weights_after": 0,
             "clustering_attempts": [],
             "processing_time": 0.0,
+            "clustering_time": 0.0,  # Per-layer clustering time (instrumentation)
             "memory_usage_mb": 0.0,
+            "sasic_neurons": 0,  # Count of neurons that used SASIC Mode A
+            "baseline_neurons": 0,  # Count of neurons that fell back to baseline
             "weight_distribution": {
                 "before": {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0},
                 "after": {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0},
             },
         }
 
-    def record_layer_processing(self, layer_name: str, processing_time: float, successful_neurons: int, total_neurons: int) -> None:
+    def record_layer_processing(self, layer_name: str, processing_time: float, successful_neurons: int, total_neurons: int, clustering_time: float = 0.0, sasic_neurons: int = 0, baseline_neurons: int = 0) -> None:
         if layer_name in self.stats["layers"]:
             failed = int(total_neurons) - int(successful_neurons)
             sr = float(successful_neurons) / max(1, int(total_neurons))
             self.stats["layers"][layer_name].update(
                 {
                     "processing_time": float(processing_time),
+                    "clustering_time": float(clustering_time),  # Per-layer clustering time
                     "neurons_successful": int(successful_neurons),
                     "neurons_processed": int(total_neurons),
                     "neurons_failed": int(failed),
                     "success_rate": float(sr),
+                    "sasic_neurons": int(sasic_neurons),  # SASIC-specific instrumentation
+                    "baseline_neurons": int(baseline_neurons),  # SASIC-specific instrumentation
                 }
             )
 
@@ -185,6 +191,25 @@ class SICProfiler:
             self.stats["convergence"]["failure_reasons"][reason] += 1
         if layer_name in self.stats["layers"]:
             self.stats["layers"][layer_name]["clustering_attempts"].append(attempt)
+    
+    def record_neuron_timing(self, layer_name: str, neuron_idx: int, timing_breakdown: Dict[str, float]) -> None:
+        """
+        Record per-neuron timing breakdown for detailed profiling.
+        
+        Args:
+            layer_name: Layer identifier
+            neuron_idx: Neuron index within the layer
+            timing_breakdown: Dict with timing keys (e.g., "jenks_time", "attachment_time", "total_time")
+        """
+        if layer_name not in self.stats["layers"]:
+            return
+        if "neuron_timings" not in self.stats["layers"][layer_name]:
+            self.stats["layers"][layer_name]["neuron_timings"] = []
+        timing_entry = {
+            "neuron": int(neuron_idx),
+            **{k: float(v) for k, v in timing_breakdown.items()},
+        }
+        self.stats["layers"][layer_name]["neuron_timings"].append(timing_entry)
 
     def record_weight_distribution(self, layer_name: str, weights_before: Any, weights_after: Any) -> None:
         if layer_name not in self.stats["layers"]:

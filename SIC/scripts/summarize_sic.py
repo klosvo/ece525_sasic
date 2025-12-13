@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-SASIC Run Summary Generator
+SIC/SASIC Run Summary Generator
 
-This script analyzes SASIC run JSON files and generates human-readable summaries
-with anomaly detection and derived metrics.
+This script analyzes SIC (baseline) and SASIC run JSON files and generates
+human-readable summaries with anomaly detection and derived metrics.
+
+Works with both baseline SIC runs and SASIC runs since they share the same
+JSON schema structure.
 
 JSON Schema Assumptions:
 - Top-level keys: "global", "phases", "layers", "convergence"
@@ -176,7 +179,7 @@ def generate_console_summary(data: Dict[str, Any]) -> str:
     
     # Header
     lines.append("=" * 80)
-    lines.append("SASIC Run Summary")
+    lines.append("SIC/SASIC Run Summary")
     lines.append("=" * 80)
     
     # Timing
@@ -274,7 +277,7 @@ def generate_markdown_summary(data: Dict[str, Any]) -> str:
     layers = data.get("layers", {})
     
     # Header
-    lines.append("# SASIC Run Summary")
+    lines.append("# SIC/SASIC Run Summary")
     lines.append("")
     lines.append(f"**Generated:** {global_data.get('start_time', 'N/A')}")
     lines.append("")
@@ -412,14 +415,14 @@ def generate_markdown_summary(data: Dict[str, Any]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate human-readable summary from SASIC run JSON",
+        description="Generate human-readable summary from SIC/SASIC run JSON",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--json",
         type=Path,
         required=True,
-        help="Path to SASIC results JSON file",
+        help="Path to SIC/SASIC results JSON file",
     )
     parser.add_argument(
         "--out",
