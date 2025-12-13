@@ -14,11 +14,16 @@ from typing import Dict, Any, Optional
 
 def safe_get(d: Dict[str, Any], *keys, default=None):
     """Safely get nested dict value."""
+    if not keys:
+        return default
+    current = d
     for key in keys:
-        if not isinstance(d, dict):
+        if not isinstance(current, dict):
             return default
-        d = d.get(key, {})
-    return d if isinstance(d, (dict, list)) or d is not None else default
+        if key not in current:
+            return default
+        current = current[key]
+    return current
 
 
 def format_time(seconds: Optional[float]) -> str:
@@ -49,9 +54,14 @@ def compare_phases(stats1: Dict, stats2: Dict, name1: str, name2: str):
     
     phases = ["filtering", "clustering", "merging", "verification"]
     for phase in phases:
-        t1 = safe_get(stats1, "phases", phase, "total_seconds")
-        t2 = safe_get(stats2, "phases", phase, "total_seconds")
-        delta = (t2 - t1) if (t1 is not None and t2 is not None) else None
+        # Profiler stores phase time as "duration", not "total_seconds"
+        t1 = safe_get(stats1, "phases", phase, "duration")
+        t2 = safe_get(stats2, "phases", phase, "duration")
+        # Only compute delta if both are numeric
+        if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+            delta = t2 - t1
+        else:
+            delta = None
         delta_str = format_time(delta) if delta is not None else "N/A"
         print(f"{phase:<20} {format_time(t1):>20} {format_time(t2):>20} {delta_str:>15}")
 
