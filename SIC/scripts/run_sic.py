@@ -364,7 +364,7 @@ def main():
     
     # Optional post-run verification: check that reported SIC activity matches weight changes
     # (Only runs if sic.verify_post_run is enabled - not part of baseline)
-    if bool(sic_cfg.get("verify_post_run", False)):
+    if bool(sic.get("verify_post_run", False)):
         import warnings
         merges = sic_profiler.stats.get("phases", {}).get("merging", {}).get("merges_performed", 0)
         successful_neurons = sic_profiler.stats.get("phases", {}).get("clustering", {}).get("successful_neurons", 0)
