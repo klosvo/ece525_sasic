@@ -44,6 +44,7 @@ sic:
   repeat_until_no_change: true
   max_k_per_neuron: 1000000
   neuron_patience: 2
+  track_k_trials: true    # Enable k-trials tracking (must match Run A)
 
   # Acceptance subset (ASC) controls
   acceptance_from: "train+val"

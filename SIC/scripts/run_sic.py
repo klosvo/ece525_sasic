@@ -361,6 +361,18 @@ def main():
 
     changed_by_sic = _fingerprint(model) != fp_before
     print(f"[SIC] Model changed: {changed_by_sic}")
+    
+    # Optional post-run verification: check that reported SIC activity matches weight changes
+    # (Only runs if sic.verify_post_run is enabled - not part of baseline)
+    if bool(sic_cfg.get("verify_post_run", False)):
+        import warnings
+        merges = sic_profiler.stats.get("phases", {}).get("merging", {}).get("merges_performed", 0)
+        successful_neurons = sic_profiler.stats.get("phases", {}).get("clustering", {}).get("successful_neurons", 0)
+        if (merges > 0 or successful_neurons > 0) and not changed_by_sic:
+            warnings.warn(
+                f"SIC reported activity (merges={merges}, successful_neurons={successful_neurons}) "
+                f"but model fingerprint unchanged. This may indicate weights were not applied."
+            )
 
     print("\nPRE-PRUNE ACCURACY")
     preprune_test_acc = float(evaluate(model.to(device_eval).eval(), eval_test_loader, device_eval))

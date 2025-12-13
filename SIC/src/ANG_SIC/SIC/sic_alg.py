@@ -12,6 +12,11 @@ from ..core.numeric import clamp_decimals, round_tensor
 from ..core.acceptance import build_acceptance_subset_from_loaders
 from .pos_common import is_pos_linear, is_pos_conv2d
 
+# NOTE: This file implements baseline SIC.
+# Any SASIC-related logic must be strictly gated and non-observable
+# when sasic.enabled == False. See Baseline Contract in docs.
+
+
 def _jenks_breaks(arr: np.ndarray, k: int) -> np.ndarray:
     return np.asarray(jenkspy.jenks_breaks(np.asarray(arr, dtype=float), int(k)), dtype=float)
 
@@ -93,6 +98,10 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     progress = bool(sic_cfg.get("progress", True))
     debug_skip = bool(sic_cfg.get("debug_skip", False))
     uwc_exclude_zero = bool(sic_cfg.get("uwc_exclude_zero", True))
+    # Optional: record after-weight distributions for regular layers (bugfix, gated)
+    record_after_weights = bool(sic_cfg.get("record_after_weights", False))
+    # Optional: track k-trials for profiling (default False to preserve baseline contract)
+    track_k_trials = bool(sic_cfg.get("track_k_trials", False))
 
     if bool(sic_cfg.get("compile_model", False)) and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -171,10 +180,11 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     total_success = 0
     initial_layer_flats: Dict[str, np.ndarray] = {}
     
-    # Initialize run-level k-trials counters once (sasic_design.md §9: metrics and logging)
-    profiler.stats.setdefault("sic", {})
-    profiler.stats["sic"].setdefault("total_k_trials", 0)
-    profiler.stats["sic"].setdefault("num_neurons_evaluated", 0)
+    # Initialize run-level k-trials counters once (only if tracking enabled)
+    if track_k_trials:
+        profiler.stats.setdefault("sic", {})
+        profiler.stats["sic"].setdefault("total_k_trials", 0)
+        profiler.stats["sic"].setdefault("num_neurons_evaluated", 0)
 
     for pass_idx in range(max_passes):
         changed_any = False
@@ -214,6 +224,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     initial_layer_flats[name] = before_flat_cpu.copy()
                     total_neurons += flat.size(0)
                     profiler.init_layer_stats(name, shp, int(w.numel()))
+                    # Record initial weights (before/after same at start)
                     profiler.record_weight_distribution(name, before_flat_cpu, before_flat_cpu)
 
                 best_flat = flat.clone()
@@ -349,9 +360,8 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                             # Skip logging for this neuron if anything goes wrong
                             pass
 
-                    # Track k-trials for this neuron (for profiler stats)
-                    # Count every k evaluation regardless of accept/reject, baseline vs SASIC
-                    k_trials_this_neuron = 0
+                    # Track k-trials for this neuron (for profiler stats, only if tracking enabled)
+                    k_trials_this_neuron = 0 if track_k_trials else None
                     
                     for k in range(1, max_k + 1):
                         if converged:
@@ -363,10 +373,10 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                 flush=True,
                             )
 
-                        # Count this k evaluation (regardless of accept/reject, baseline vs SASIC)
-                        # (sasic_design.md §9: track number of k values attempted per neuron)
-                        k_trials_this_neuron += 1
-                        profiler.stats["sic"]["total_k_trials"] += 1
+                        # Count this k evaluation (only if tracking enabled)
+                        if track_k_trials:
+                            k_trials_this_neuron += 1
+                            profiler.stats["sic"]["total_k_trials"] += 1
                         
                         # SASIC Mode A clustering (sasic_design.md §5.1, step 3):
                         # Run Jenks clustering on {w_i : i in A} (active inputs only)
@@ -671,23 +681,29 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         profiler.record_neuron_attempt(name, idx, max_k, False, "max_clusters_exceeded")
                         no_change[idx] = no_change[idx] + 1
                     
-                    # Record k-trials for this neuron (for profiler stats)
-                    # Track both per-layer and global totals (sasic_design.md §9: metrics and logging)
-                    # Per-layer stats use profiler.stats["layers"] schema (consistent with existing profiler)
-                    if name not in profiler.stats["layers"]:
-                        profiler.stats["layers"][name] = {}
-                    layer_stats = profiler.stats["layers"][name]
-                    if "k_trials_list" not in layer_stats:
-                        layer_stats["k_trials_list"] = []
-                    layer_stats["k_trials_list"].append(k_trials_this_neuron)
-                    
-                    # Increment neuron counter once per neuron (after k-loop finishes)
-                    profiler.stats["sic"]["num_neurons_evaluated"] += 1
+                    # Record k-trials for this neuron (only if tracking enabled)
+                    if track_k_trials:
+                        # Track both per-layer and global totals
+                        # Per-layer stats use profiler.stats["layers"] schema (consistent with existing profiler)
+                        if name not in profiler.stats["layers"]:
+                            profiler.stats["layers"][name] = {}
+                        layer_stats = profiler.stats["layers"][name]
+                        if "k_trials_list" not in layer_stats:
+                            layer_stats["k_trials_list"] = []
+                        layer_stats["k_trials_list"].append(k_trials_this_neuron)
+                        
+                        # Increment neuron counter once per neuron (after k-loop finishes)
+                        profiler.stats["sic"]["num_neurons_evaluated"] += 1
 
                 with torch.no_grad():
                     module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
                 setattr(module, "_sic_pos_clusters", pos_clusters_for_layer)
                 setattr(module, "_sic_no_change", no_change)
+                
+                # Record weight distribution after SIC (for regular layers) - gated bugfix
+                if record_after_weights and pass_idx == max_passes - 1 and name in initial_layer_flats:
+                    after_flat_cpu = _flatten_weight(module.weight).detach().cpu().numpy()
+                    profiler.record_weight_distribution(name, initial_layer_flats[name], after_flat_cpu)
                 
                 # SASIC: Store per-layer active input stats in profiler (only on first pass)
                 if sasic_layer_active and sasic_layer_stats is not None:
@@ -708,8 +724,8 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         # Skip logging for this layer if anything goes wrong
                         pass
                 
-                # Compute per-layer k-trials statistics (sasic_design.md §9: per-layer metrics)
-                if name in profiler.stats["layers"]:
+                # Compute per-layer k-trials statistics (only if tracking enabled)
+                if track_k_trials and name in profiler.stats["layers"]:
                     layer_stats = profiler.stats["layers"][name]
                     if "k_trials_list" in layer_stats and layer_stats["k_trials_list"]:
                         k_trials_list = layer_stats["k_trials_list"]
@@ -942,6 +958,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                             if int(idxs.sum().item()) > 1:
                                 row[idxs] = row[idxs].mean()
                                 merges += 1
+                    # Write back merged weights to actual model parameter tensor
                     module.weight.copy_(flat_t.view_as(w) if w.ndim > 2 else flat_t)
             for name, module in model.named_modules():
                 if not _is_indexed_sparse_linear(module):
@@ -965,6 +982,28 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
         profiler.stats["phases"]["merging"]["merges_performed"] = merges
         profiler.end_phase("merging")
 
+    # Compute final global stats after all SIC operations
+    profiler.stats["global"]["final_params"] = sum(p.numel() for p in model.parameters())
+    original_params = profiler.stats["global"].get("original_params", 0)
+    final_params = profiler.stats["global"]["final_params"]
+    if original_params > 0:
+        profiler.stats["global"]["compression_ratio"] = float(original_params / max(1, final_params))
+    
+    # Compute effective_params (unique nonzero weights after rounding)
+    effective_params = 0
+    zero_params = 0
+    for p in model.parameters():
+        if p.numel() > 0:
+            p_flat = p.detach().cpu().numpy().flatten()
+            zero_params += int(np.sum(p_flat == 0))
+            # Count unique nonzero values after rounding
+            p_nz = p_flat[p_flat != 0]
+            if p_nz.size > 0:
+                p_rounded = np.round(p_nz, decimals=rounding_decimals)
+                effective_params += int(np.unique(p_rounded).size)
+    profiler.stats["global"]["effective_params"] = effective_params
+    profiler.stats["global"]["zero_params"] = zero_params
+    
     profiler.start_phase("verification")
     profiler.end_phase("verification")
     profiler.end_profiling()
