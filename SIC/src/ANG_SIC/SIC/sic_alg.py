@@ -236,11 +236,6 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                 success_count_this_layer = 0
                 num_neurons = flat.size(0)
                 
-                # Instrumentation: Track clustering time and SASIC usage per layer
-                layer_clustering_time = 0.0
-                layer_sasic_neurons = 0
-                layer_baseline_neurons = 0
-                
                 # SASIC: Initialize per-layer active input stats accumulation (only on first pass)
                 sasic_layer_active = (
                     pass_idx == 0
@@ -364,30 +359,13 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                 active_mask_nz_cached = active_mask_full[nz]
                                 num_active_nz_cached = int(np.sum(active_mask_nz_cached))
                                 if num_active_nz_cached >= 2:
-                                    active_indices_full_arr = np.where(active_mask_full)[0]
-                                    active_nz_indices_full_arr = np.where(active_mask_full & nz)[0]
-                                    active_zero_indices_arr = np.where(active_mask_full & ~nz)[0]
-                                    
-                                    # Optimization: Pre-compute mapping from nz_idx to position in active_indices_full
-                                    # This avoids repeated np.where searches in the k-loop
-                                    # Use dict for O(1) lookup instead of O(n) search
-                                    nz_to_active_pos = {int(nz_idx): int(pos) for pos, nz_idx in enumerate(active_nz_indices_full_arr)}
-                                    # Map zero indices to their position in active_indices_full (if they're in active set)
-                                    zero_to_active_pos = {}
-                                    for zero_idx in active_zero_indices_arr:
-                                        pos_in_active = np.searchsorted(active_indices_full_arr, zero_idx)
-                                        if pos_in_active < len(active_indices_full_arr) and active_indices_full_arr[pos_in_active] == zero_idx:
-                                            zero_to_active_pos[int(zero_idx)] = int(pos_in_active)
-                                    
                                     # Cache these for reuse in k-loop
                                     sasic_cached = {
                                         "active_mask_nz": active_mask_nz_cached,
-                                        "active_indices_full": active_indices_full_arr,
-                                        "active_nz_indices_full": active_nz_indices_full_arr,
+                                        "active_indices_full": np.where(active_mask_full)[0],
+                                        "active_nz_indices_full": np.where(active_mask_full & nz)[0],
                                         "active_zero_mask": active_mask_full & ~nz,
-                                        "active_zero_indices": active_zero_indices_arr,
-                                        "nz_to_active_pos": nz_to_active_pos,  # Optimization: dict lookup
-                                        "zero_to_active_pos": zero_to_active_pos,  # Optimization: dict lookup
+                                        "active_zero_indices": np.where(active_mask_full & ~nz)[0],
                                     }
                                 else:
                                     # Not enough active nonzero, will fallback in k-loop
@@ -409,12 +387,6 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
 
                     # Track k-trials for this neuron (for profiler stats, only if tracking enabled)
                     k_trials_this_neuron = 0 if track_k_trials else None
-                    
-                    # Instrumentation: Track initial SASIC state (before k-loop, for stats)
-                    neuron_used_sasic_initially = sasic_active and active_mask_full is not None
-                    
-                    # Instrumentation: Track neuron-level clustering time
-                    neuron_clustering_start = perf_counter()
                     
                     # Timing instrumentation for SASIC profiling (if enabled)
                     neuron_timing = None
@@ -529,16 +501,12 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                     cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
                                     
                                     # Map assignments from active nonzero to active full (optimized with cached indices)
+                                    # CRITICAL FIX: Only assign clusters to active nonzero indices
+                                    # Active zeros remain zero (preserved like baseline SIC)
                                     assignment_start = perf_counter() if neuron_timing is not None else None
-                                    if sasic_cached is not None and "nz_to_active_pos" in sasic_cached:
-                                        # Optimization: Use pre-computed dict lookup (O(1) instead of O(n) search)
-                                        nz_to_active_pos = sasic_cached["nz_to_active_pos"]
-                                        for i, nz_idx in enumerate(active_nz_indices_full):
-                                            pos_in_active = nz_to_active_pos.get(int(nz_idx))
-                                            if pos_in_active is not None:
-                                                cluster_assignments_full[pos_in_active] = cluster_assignments_active[i]
-                                    elif sasic_cached is not None:
-                                        # Fallback: Use searchsorted (slower than dict but faster than np.where)
+                                    if sasic_cached is not None:
+                                        # Use cached indices - create lookup dict for faster mapping
+                                        # active_indices_full is sorted, so we can use searchsorted
                                         for i, nz_idx in enumerate(active_nz_indices_full):
                                             pos_in_active = np.searchsorted(active_indices_full, nz_idx)
                                             if pos_in_active < len(active_indices_full) and active_indices_full[pos_in_active] == nz_idx:
@@ -550,24 +518,10 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                             if len(pos) > 0:
                                                 cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
                                     
-                                    # For active zero inputs, assign to nearest cluster center by distance from 0.0
-                                    # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
-                                    if len(active_zero_indices) > 0:
-                                        distances_to_zero = np.abs(cluster_centers - 0.0)
-                                        nearest_cluster_for_zero = int(np.argmin(distances_to_zero))
-                                        if sasic_cached is not None and "zero_to_active_pos" in sasic_cached:
-                                            # Optimization: Use pre-computed dict lookup
-                                            zero_to_active_pos = sasic_cached["zero_to_active_pos"]
-                                            for zero_idx in active_zero_indices:
-                                                pos_in_active = zero_to_active_pos.get(int(zero_idx))
-                                                if pos_in_active is not None:
-                                                    cluster_assignments_full[pos_in_active] = nearest_cluster_for_zero
-                                        else:
-                                            # Original method (slower, but preserves baseline behavior when caching disabled)
-                                            for zero_idx in active_zero_indices:
-                                                pos = np.where(active_indices_full == zero_idx)[0]
-                                                if len(pos) > 0:
-                                                    cluster_assignments_full[pos[0]] = nearest_cluster_for_zero
+                                    # REMOVED: Active zero assignment code
+                                    # Active zeros now remain zero (preserved like baseline SIC)
+                                    # This fixes the semantic issue where zeros were being converted to nonzero values
+                                    
                                     if neuron_timing is not None and assignment_start is not None:
                                         neuron_timing["assignment_time"] += perf_counter() - assignment_start
                                     
@@ -709,16 +663,11 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                     cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
                                     
                                     # Create mapping: for each active nonzero input, find its position in active_indices_full
+                                    # CRITICAL FIX: Only assign clusters to active nonzero indices
+                                    # Active zeros remain zero (preserved like baseline SIC)
                                     assignment_start = perf_counter() if neuron_timing is not None else None
-                                    if sasic_cached is not None and "nz_to_active_pos" in sasic_cached:
-                                        # Optimization: Use pre-computed dict lookup (O(1) instead of O(n) search)
-                                        nz_to_active_pos = sasic_cached["nz_to_active_pos"]
-                                        for i, nz_idx in enumerate(active_nz_indices_full):
-                                            pos_in_active = nz_to_active_pos.get(int(nz_idx))
-                                            if pos_in_active is not None:
-                                                cluster_assignments_full[pos_in_active] = cluster_assignments_active[i]
-                                    elif sasic_cached is not None:
-                                        # Fallback: Use searchsorted (slower than dict but faster than np.where)
+                                    if sasic_cached is not None:
+                                        # Use cached indices - active_indices_full is sorted, so we can use searchsorted
                                         for i, nz_idx in enumerate(active_nz_indices_full):
                                             pos_in_active = np.searchsorted(active_indices_full, nz_idx)
                                             if pos_in_active < len(active_indices_full) and active_indices_full[pos_in_active] == nz_idx:
@@ -730,24 +679,10 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                             if len(pos) > 0:
                                                 cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
                                     
-                                    # For active zero inputs, assign to nearest cluster center by distance from 0.0
-                                    # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
-                                    if len(active_zero_indices) > 0:
-                                        distances_to_zero = np.abs(cluster_centers - 0.0)
-                                        nearest_cluster_for_zero = int(np.argmin(distances_to_zero))
-                                        if sasic_cached is not None and "zero_to_active_pos" in sasic_cached:
-                                            # Optimization: Use pre-computed dict lookup
-                                            zero_to_active_pos = sasic_cached["zero_to_active_pos"]
-                                            for zero_idx in active_zero_indices:
-                                                pos_in_active = zero_to_active_pos.get(int(zero_idx))
-                                                if pos_in_active is not None:
-                                                    cluster_assignments_full[pos_in_active] = nearest_cluster_for_zero
-                                        else:
-                                            # Original method (slower, but preserves baseline behavior when caching disabled)
-                                            for zero_idx in active_zero_indices:
-                                                pos = np.where(active_indices_full == zero_idx)[0]
-                                                if len(pos) > 0:
-                                                    cluster_assignments_full[pos[0]] = nearest_cluster_for_zero
+                                    # REMOVED: Active zero assignment code
+                                    # Active zeros now remain zero (preserved like baseline SIC)
+                                    # This fixes the semantic issue where zeros were being converted to nonzero values
+                                    
                                     if neuron_timing is not None and assignment_start is not None:
                                         neuron_timing["assignment_time"] += perf_counter() - assignment_start
                                     
@@ -833,16 +768,6 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         profiler.record_neuron_attempt(name, idx, max_k, False, "max_clusters_exceeded")
                         no_change[idx] = no_change[idx] + 1
                     
-                    # Instrumentation: Record neuron clustering time
-                    neuron_clustering_time = perf_counter() - neuron_clustering_start
-                    layer_clustering_time += neuron_clustering_time
-                    
-                    # Instrumentation: Track SASIC vs baseline usage (based on initial state before k-loop)
-                    if neuron_used_sasic_initially:
-                        layer_sasic_neurons += 1
-                    else:
-                        layer_baseline_neurons += 1
-                    
                     # Record neuron timing breakdown (if profiling enabled)
                     if neuron_timing is not None:
                         neuron_timing["total_time"] = perf_counter() - neuron_timing_start
@@ -902,15 +827,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                 
                 if autosave_each and autosave_path:
                     profiler.save_detailed_stats(autosave_path)
-                profiler.record_layer_processing(
-                    name, 
-                    perf_counter() - layer_t0, 
-                    success_count_this_layer, 
-                    num_neurons,
-                    clustering_time=layer_clustering_time,
-                    sasic_neurons=layer_sasic_neurons,
-                    baseline_neurons=layer_baseline_neurons,
-                )
+                profiler.record_layer_processing(name, perf_counter() - layer_t0, success_count_this_layer, num_neurons)
                 if progress:
                     print(" " * 120, end="\r")
                 continue

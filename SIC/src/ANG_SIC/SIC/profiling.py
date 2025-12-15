@@ -150,30 +150,24 @@ class SICProfiler:
             "zero_weights_after": 0,
             "clustering_attempts": [],
             "processing_time": 0.0,
-            "clustering_time": 0.0,  # Per-layer clustering time (instrumentation)
             "memory_usage_mb": 0.0,
-            "sasic_neurons": 0,  # Count of neurons that used SASIC Mode A
-            "baseline_neurons": 0,  # Count of neurons that fell back to baseline
             "weight_distribution": {
                 "before": {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0},
                 "after": {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0},
             },
         }
 
-    def record_layer_processing(self, layer_name: str, processing_time: float, successful_neurons: int, total_neurons: int, clustering_time: float = 0.0, sasic_neurons: int = 0, baseline_neurons: int = 0) -> None:
+    def record_layer_processing(self, layer_name: str, processing_time: float, successful_neurons: int, total_neurons: int) -> None:
         if layer_name in self.stats["layers"]:
             failed = int(total_neurons) - int(successful_neurons)
             sr = float(successful_neurons) / max(1, int(total_neurons))
             self.stats["layers"][layer_name].update(
                 {
                     "processing_time": float(processing_time),
-                    "clustering_time": float(clustering_time),  # Per-layer clustering time
                     "neurons_successful": int(successful_neurons),
                     "neurons_processed": int(total_neurons),
                     "neurons_failed": int(failed),
                     "success_rate": float(sr),
-                    "sasic_neurons": int(sasic_neurons),  # SASIC-specific instrumentation
-                    "baseline_neurons": int(baseline_neurons),  # SASIC-specific instrumentation
                 }
             )
 

@@ -129,9 +129,12 @@ def attach_quiet_inputs_to_clusters(
     Attach quiet inputs to nearest cluster centers by weight distance.
     
     Implements Mode A quiet input attachment (sasic_design.md §5.1, step 4):
-    - Active inputs are already assigned to clusters (via cluster_assignments).
-    - Quiet inputs (j not in A) are attached to nearest cluster center by weight distance:
-      j -> argmin_c |w_j - mu_c|
+    - Active NONZERO inputs are assigned to clusters (via cluster_assignments).
+    - Quiet NONZERO inputs are attached to nearest cluster center by weight distance.
+    - ALL zeros (active and quiet) are preserved as 0.0 (never converted to nonzero).
+    
+    CRITICAL: This function preserves exact zeros (w == 0.0) like baseline SIC.
+    Only nonzero weights are modified.
     
     Args:
         weights_full: 1D numpy array of original input weights for this neuron
@@ -139,17 +142,19 @@ def attach_quiet_inputs_to_clusters(
         active_mask: Boolean mask (1D numpy array), True = active, False = quiet.
             Must have same length as weights_full.
         cluster_centers: 1D numpy array of cluster centers (one per cluster),
-            computed from Jenks clustering on active inputs.
-        cluster_assignments: 1D numpy array of cluster indices for active inputs only.
+            computed from Jenks clustering on active nonzero inputs.
+        cluster_assignments: 1D numpy array of cluster indices for active inputs.
             Length should equal np.sum(active_mask).
             cluster_assignments[i] is the cluster index for the i-th active input.
+            Only entries for active nonzero inputs are meaningful.
         vectorized: If True (default), use vectorized distance computation for quiet inputs.
             If False, use the original loop-based implementation.
     
     Returns:
         1D numpy array of same length as weights_full, containing consolidated values:
-        - Active inputs: assigned to their cluster center (from cluster_assignments).
-        - Quiet inputs: assigned to nearest cluster center by |w - center|.
+        - Active nonzero inputs: assigned to their cluster center (from cluster_assignments).
+        - Quiet nonzero inputs: assigned to nearest cluster center by |w - center|.
+        - ALL zeros (active and quiet): preserved as 0.0 (unchanged).
     """
     if len(weights_full) != len(active_mask):
         raise ValueError(
@@ -164,32 +169,50 @@ def attach_quiet_inputs_to_clusters(
     
     consolidated = weights_full.copy()
     
-    # Map active inputs to their cluster centers
-    active_indices = np.where(active_mask)[0]
-    for i, input_idx in enumerate(active_indices):
-        cluster_idx = int(cluster_assignments[i])
-        if 0 <= cluster_idx < len(cluster_centers):
-            consolidated[input_idx] = cluster_centers[cluster_idx]
+    # CRITICAL FIX: Only process nonzero indices to preserve zeros like baseline SIC
+    # Mode A must never convert exact zeros (w == 0.0) into nonzero values
     
-    # Attach quiet inputs to nearest cluster center
+    # Map active NONZERO inputs to their cluster centers (preserve active zeros)
+    # cluster_assignments[i] corresponds to the i-th active input in active_indices
+    # We only process entries where the active input is nonzero
+    active_indices = np.where(active_mask)[0]
+    nz_mask = weights_full != 0.0
+    
+    # Map active nonzero to cluster centers
+    # cluster_assignments[pos] is the cluster for active_indices[pos]
+    # We only process entries where active_indices[pos] is nonzero
+    for pos_in_active, input_idx in enumerate(active_indices):
+        if pos_in_active < len(cluster_assignments):
+            # Only assign cluster center if this active input is nonzero
+            # Active zeros remain zero (preserved)
+            if nz_mask[input_idx]:
+                cluster_idx = int(cluster_assignments[pos_in_active])
+                if 0 <= cluster_idx < len(cluster_centers):
+                    consolidated[input_idx] = cluster_centers[cluster_idx]
+            # If input_idx is zero (active zero), we skip it (preserve as 0.0)
+    
+    # Attach quiet NONZERO inputs to nearest cluster center (preserve quiet zeros)
     quiet_indices = np.where(~active_mask)[0]
-    if len(quiet_indices) == 0:
+    quiet_nz_mask = nz_mask[quiet_indices]
+    quiet_nz_indices = quiet_indices[quiet_nz_mask]
+    
+    if len(quiet_nz_indices) == 0:
         return consolidated
     
     if vectorized:
         # Vectorized: compute all distances at once
-        # Shape: (num_quiet, num_clusters) - distance from each quiet weight to each cluster center
-        quiet_weights = weights_full[quiet_indices]
-        # Broadcasting: quiet_weights[:, None] - cluster_centers[None, :]
-        # Results in (num_quiet, num_clusters) matrix of distances
-        distances = np.abs(quiet_weights[:, None] - cluster_centers[None, :])
-        # Find nearest cluster for each quiet input (argmin along cluster axis)
+        # Shape: (num_quiet_nz, num_clusters) - distance from each quiet nonzero weight to each cluster center
+        quiet_nz_weights = weights_full[quiet_nz_indices]
+        # Broadcasting: quiet_nz_weights[:, None] - cluster_centers[None, :]
+        # Results in (num_quiet_nz, num_clusters) matrix of distances
+        distances = np.abs(quiet_nz_weights[:, None] - cluster_centers[None, :])
+        # Find nearest cluster for each quiet nonzero input (argmin along cluster axis)
         nearest_clusters = np.argmin(distances, axis=1)
-        # Assign cluster centers to quiet inputs
-        consolidated[quiet_indices] = cluster_centers[nearest_clusters]
+        # Assign cluster centers to quiet nonzero inputs only
+        consolidated[quiet_nz_indices] = cluster_centers[nearest_clusters]
     else:
         # Original loop-based implementation (for compatibility/testing)
-        for input_idx in quiet_indices:
+        for input_idx in quiet_nz_indices:
             w_quiet = weights_full[input_idx]
             distances = np.abs(cluster_centers - w_quiet)
             nearest_cluster = int(np.argmin(distances))
