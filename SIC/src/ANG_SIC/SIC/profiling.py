@@ -108,6 +108,17 @@ class SICProfiler:
             self.stats["global"]["memory_peak_mb"] = self.memory_tracker.get_peak_memory()
             self.stats["global"]["memory_saved_mb"] = self.memory_tracker.get_memory_saved()
             self.stats["memory_timeline"] = list(self.memory_tracker.timeline)
+        
+        # Compute final k-trials statistics (avg_k_trials_per_neuron)
+        # (sasic_design.md §9: aggregate metrics for comparing baseline vs SASIC)
+        if "sic" in self.stats:
+            sic_stats = self.stats["sic"]
+            if "total_k_trials" in sic_stats and "num_neurons_evaluated" in sic_stats:
+                total_k = sic_stats["total_k_trials"]
+                num_neurons = sic_stats["num_neurons_evaluated"]
+                if num_neurons > 0:
+                    sic_stats["avg_k_trials_per_neuron"] = float(total_k / num_neurons)
+        
         print(f"[PROFILER] Completed profiling. Total duration: {self.stats['global']['total_duration']:.2f}s")
 
     def start_phase(self, phase_name: str) -> None:
@@ -174,6 +185,25 @@ class SICProfiler:
             self.stats["convergence"]["failure_reasons"][reason] += 1
         if layer_name in self.stats["layers"]:
             self.stats["layers"][layer_name]["clustering_attempts"].append(attempt)
+    
+    def record_neuron_timing(self, layer_name: str, neuron_idx: int, timing_breakdown: Dict[str, float]) -> None:
+        """
+        Record per-neuron timing breakdown for detailed profiling.
+        
+        Args:
+            layer_name: Layer identifier
+            neuron_idx: Neuron index within the layer
+            timing_breakdown: Dict with timing keys (e.g., "jenks_time", "attachment_time", "total_time")
+        """
+        if layer_name not in self.stats["layers"]:
+            return
+        if "neuron_timings" not in self.stats["layers"][layer_name]:
+            self.stats["layers"][layer_name]["neuron_timings"] = []
+        timing_entry = {
+            "neuron": int(neuron_idx),
+            **{k: float(v) for k, v in timing_breakdown.items()},
+        }
+        self.stats["layers"][layer_name]["neuron_timings"].append(timing_entry)
 
     def record_weight_distribution(self, layer_name: str, weights_before: Any, weights_after: Any) -> None:
         if layer_name not in self.stats["layers"]:

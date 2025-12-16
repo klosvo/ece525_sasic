@@ -1,9 +1,10 @@
+# Dev config for fast SIC/SASIC experiments on HPC (no pruning, no compile)
 # =========================
 # Top-level
 # =========================
 device: auto
 dataset: MNIST
-model: LeNet5Tanh
+model: SmallMNISTCNN
 
 # =========================
 # Data & Training
@@ -42,15 +43,15 @@ sic:
   rounding_decimals: 32
   max_passes: 1
   repeat_until_no_change: true
-  max_k_per_neuron: 1000000
-  neuron_patience: 2
+  max_k_per_neuron: 3
+  neuron_patience: 1
   track_k_trials: true    # Enable k-trials tracking (must match Run A)
 
   # Acceptance subset (ASC) controls
   acceptance_from: "train+val"
-  eval_max: null
+  eval_max: 32
   tiered_asc:
-    enable: true
+    enable: false
     fast: 1024
     medium: 2048
 
@@ -79,8 +80,9 @@ sic:
   min_pass_weight_delta: 0.0
 
   # PoS materialization & acceleration
-  enable_product_of_sums: true  
-  fast_pos_accel: true           
+  enable_product_of_sums: true 
+  # The key point: do NOT use PoS-specific compile/accel paths in dev runs. 
+  fast_pos_accel: false           
   fast_pos_compile: false
 
 # =========================
@@ -98,8 +100,8 @@ prune:
 # SASIC (Sparsity-Aware SIC)
 # =========================
 sasic:
-  enabled: false
-  mode: "none"          # valid values for now: "none", "active"
+  enabled: true
+  mode: "active"          # valid values for now: "none", "active"
   calibration_fraction: 0.1
   activation_stat: "p_above"
   activation_threshold: 0.01

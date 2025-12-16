@@ -1,9 +1,10 @@
+# Baseline SIC dev config with k-trials tracking
 # =========================
 # Top-level
 # =========================
 device: auto
 dataset: MNIST
-model: LeNet5Tanh
+model: SmallMNISTCNN
 
 # =========================
 # Data & Training
@@ -42,10 +43,10 @@ sic:
   rounding_decimals: 32
   max_passes: 1
   repeat_until_no_change: true
-  max_k_per_neuron: 1000000
+  max_k_per_neuron: 4
   neuron_patience: 2
-  track_k_trials: true    # Enable k-trials tracking (must match Run A)
-
+  track_k_trials: true    # Enable k-trials tracking for comparison
+ 
   # Acceptance subset (ASC) controls
   acceptance_from: "train+val"
   eval_max: null
@@ -79,8 +80,9 @@ sic:
   min_pass_weight_delta: 0.0
 
   # PoS materialization & acceleration
-  enable_product_of_sums: true  
-  fast_pos_accel: true           
+  enable_product_of_sums: true 
+  # The key point: do NOT use PoS-specific compile/accel paths in dev runs. 
+  fast_pos_accel: false           
   fast_pos_compile: false
 
 # =========================
@@ -95,11 +97,11 @@ prune:
   check_batch_size: 1024
 
 # =========================
-# SASIC (Sparsity-Aware SIC)
+# SASIC (Sparsity-Aware SIC) - DISABLED
 # =========================
 sasic:
   enabled: false
-  mode: "none"          # valid values for now: "none", "active"
+  mode: "none"          # Baseline: SASIC disabled
   calibration_fraction: 0.1
   activation_stat: "p_above"
   activation_threshold: 0.01

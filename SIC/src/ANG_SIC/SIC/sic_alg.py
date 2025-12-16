@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Union, List, Dict, Any
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +12,11 @@ from .sic_utils import all_samples_correct
 from ..core.numeric import clamp_decimals, round_tensor
 from ..core.acceptance import build_acceptance_subset_from_loaders
 from .pos_common import is_pos_linear, is_pos_conv2d
+
+# NOTE: This file implements baseline SIC.
+# Any SASIC-related logic must be strictly gated and non-observable
+# when sasic.enabled == False. See Baseline Contract in docs.
+
 
 def _jenks_breaks(arr: np.ndarray, k: int) -> np.ndarray:
     return np.asarray(jenkspy.jenks_breaks(np.asarray(arr, dtype=float), int(k)), dtype=float)
@@ -72,10 +78,11 @@ def _write_back_indexed_sparse_vals(m: nn.Module, s: Union[int, torch.Tensor], e
         m.theta[s:e] = vals.to(m.theta.device)
 
 @torch.inference_mode()
-def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: bool, profiler: Optional[SICProfiler], cfg: Optional[Dict[str, Any]], val_loader=None, mode: str = "classic"):
+def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: bool, profiler: Optional[SICProfiler], cfg: Optional[Dict[str, Any]], val_loader=None, mode: str = "classic", calibration_loader=None):
     cfg = cfg or {}
     sic_cfg = cfg.get("sic", {}) or {}
     io_cfg = cfg.get("io", {}) or {}
+    sasic_cfg = cfg.get("sasic", {}) or {}
 
     rounding_decimals = int(sic_cfg.get("rounding_decimals", 6))
     neuron_log_path = io_cfg.get("neuron_log_path", "SIC_per_neuron_times.jsonl")
@@ -92,6 +99,27 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     progress = bool(sic_cfg.get("progress", True))
     debug_skip = bool(sic_cfg.get("debug_skip", False))
     uwc_exclude_zero = bool(sic_cfg.get("uwc_exclude_zero", True))
+    # Optional: record after-weight distributions for regular layers (bugfix, gated)
+    record_after_weights = bool(sic_cfg.get("record_after_weights", False))
+    # Optional: track k-trials for profiling (default False to preserve baseline contract)
+    track_k_trials = bool(sic_cfg.get("track_k_trials", False))
+    
+    # SASIC optimizations (default False for safety, enable via config)
+    sasic_cache_indices = bool(sasic_cfg.get("cache_indices", False))
+    sasic_vectorized_attachment = bool(sasic_cfg.get("vectorized_attachment", False))
+    sasic_profile_timing = bool(sasic_cfg.get("profile_timing", False))
+    
+    # SASIC k-heuristic (SASIC-only, default OFF to preserve baseline contract)
+    k_heuristic_cfg = sasic_cfg.get("k_heuristic", {}) or {}
+    k_heuristic_enabled = (
+        bool(sasic_cfg.get("enabled", False))
+        and sasic_cfg.get("mode") != "none"
+        and bool(k_heuristic_cfg.get("enabled", False))
+    )
+    k_heuristic_mode = str(k_heuristic_cfg.get("mode", "budgeted_sweep"))
+    k_heuristic_max_trials = k_heuristic_cfg.get("max_trials_per_neuron", None)
+    if k_heuristic_max_trials is not None:
+        k_heuristic_max_trials = int(k_heuristic_max_trials)
 
     if bool(sic_cfg.get("compile_model", False)) and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -144,11 +172,37 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     profiler.stats["phases"]["filtering"]["samples_after"] = int(len(filtered_dataset))
     profiler.end_phase("filtering")
 
+    # SASIC: Collect activation statistics if enabled
+    activation_stats = None
+    if calibration_loader is not None and sasic_cfg.get("enabled", False) and sasic_cfg.get("mode") == "active":
+        from .activation_stats import collect_activation_stats
+        calib_start = perf_counter()
+        print("\n[SASIC] Collecting activation statistics from calibration slice...")
+        activation_stats = collect_activation_stats(
+            model=model,
+            loader=calibration_loader,
+            device=device,
+            sasic_cfg=sasic_cfg,
+            sic_cfg=cfg,
+        )
+        calib_time = perf_counter() - calib_start
+        num_batches = len(calibration_loader)
+        print(f"[SASIC] Calibration complete: {num_batches} batches, {calib_time:.2f}s")
+        if profiler:
+            profiler.stats.setdefault("sasic", {})["calibration_time_sec"] = calib_time
+            profiler.stats["sasic"]["calibration_batches"] = num_batches
+
     profiler.start_phase("clustering")
     neuron_log = LogBuffer(neuron_log_path, flush_every=log_flush_every) if enable_neuron_log else None
     total_neurons = 0
     total_success = 0
     initial_layer_flats: Dict[str, np.ndarray] = {}
+    
+    # Initialize run-level k-trials counters once (only if tracking enabled)
+    if track_k_trials:
+        profiler.stats.setdefault("sic", {})
+        profiler.stats["sic"].setdefault("total_k_trials", 0)
+        profiler.stats["sic"].setdefault("num_neurons_evaluated", 0)
 
     for pass_idx in range(max_passes):
         changed_any = False
@@ -188,11 +242,27 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     initial_layer_flats[name] = before_flat_cpu.copy()
                     total_neurons += flat.size(0)
                     profiler.init_layer_stats(name, shp, int(w.numel()))
+                    # Record initial weights (before/after same at start)
                     profiler.record_weight_distribution(name, before_flat_cpu, before_flat_cpu)
 
                 best_flat = flat.clone()
                 success_count_this_layer = 0
                 num_neurons = flat.size(0)
+                
+                # SASIC: Initialize per-layer active input stats accumulation (only on first pass)
+                sasic_layer_active = (
+                    pass_idx == 0
+                    and sasic_cfg.get("enabled", False)
+                    and sasic_cfg.get("mode") == "active"
+                    and activation_stats is not None
+                )
+                sasic_layer_stats = None
+                if sasic_layer_active:
+                    sasic_layer_stats = {
+                        "num_inputs_list": [],
+                        "num_active_list": [],
+                        "active_frac_list": [],
+                    }
                 pos_clusters_for_layer = getattr(module, "_sic_pos_clusters", [[] for _ in range(num_neurons)])
                 if len(pos_clusters_for_layer) != num_neurons:
                     pos_clusters_for_layer = [[] for _ in range(num_neurons)]
@@ -239,7 +309,134 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         flat[idx] = orig_t
                         profiler.record_neuron_attempt(name, idx, 0, False, "zero_rejected")
 
-                    for k in range(1, max_k + 1):
+                    # SASIC Mode A — Active-Subset SASIC (sasic_design.md §5.1)
+                    # Mode A is active for this neuron if and only if ALL of the following are true:
+                    # 1. SASIC is enabled and mode is "active"
+                    # 2. Global activation_stats exist and contain data for this layer/neuron
+                    # 3. We can build an active_mask_full with length exactly equal to len(orig_np)
+                    # 4. The active set A is "non-trivial": at least 2 active inputs AND
+                    #    active fraction is neither ~0% nor ~100% (optimization: skip if >95% active)
+                    # If any condition fails, Mode A is disabled for this neuron and we use pure baseline.
+                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                    sasic_active = (
+                        sasic_cfg.get("enabled", False)
+                        and sasic_cfg.get("mode") == "active"
+                        and activation_stats is not None
+                    )
+                    
+                    active_mask_full = None
+                    # Cached indices/masks for SASIC optimizations (computed once per neuron, reused in k-loop)
+                    sasic_cached = None
+                    if sasic_active:
+                        from .sasic_utils import get_layer_key_for_sasic, get_active_indices_for_neuron
+                        layer_key = get_layer_key_for_sasic(name, module)
+                        # activation_threshold maps to tau_active in design doc (§5.1, §7.2)
+                        activation_threshold = float(sasic_cfg.get("activation_threshold", 0.01))
+                        # Pass ground-truth num_inputs to ensure mask length matches weight vector
+                        # (sasic_design.md §4.3: stats must align with flattened weight indices)
+                        active_mask_full = get_active_indices_for_neuron(
+                            activation_stats, layer_key, idx, activation_threshold, num_inputs=len(orig_np)
+                        )
+                        
+                        # Conservative fallback conditions (sasic_design.md §10: must preserve baseline when disabled)
+                        # All checks must pass; if any fails, abort Mode A entirely for this neuron.
+                        if active_mask_full is None:
+                            # Stats missing or inconsistent
+                            sasic_active = False
+                            active_mask_full = None
+                        elif active_mask_full.shape[0] != len(orig_np):
+                            # Hard requirement: mask length must match weight vector length
+                            sasic_active = False
+                            active_mask_full = None
+                        else:
+                            num_active = int(np.sum(active_mask_full))
+                            active_frac = float(num_active / len(orig_np)) if len(orig_np) > 0 else 0.0
+                            
+                            # Fallback if active set is too small (< 2 active inputs)
+                            # (Design doc §5.1 requires clustering on active inputs; need at least 2 for Jenks)
+                            if num_active < 2:
+                                sasic_active = False
+                                active_mask_full = None
+                            # Optimization: skip SASIC if almost all inputs are active (>95%)
+                            # This avoids overhead when Mode A provides little benefit
+                            elif active_frac > 0.95:
+                                sasic_active = False
+                                active_mask_full = None
+                            # Fallback if no active inputs (should be caught above, but double-check)
+                            elif num_active == 0:
+                                sasic_active = False
+                                active_mask_full = None
+                            elif sasic_cache_indices:
+                                # Cache active indices/masks for reuse in k-loop (optimization)
+                                # This avoids repeated np.where and mask computations
+                                active_mask_nz_cached = active_mask_full[nz]
+                                num_active_nz_cached = int(np.sum(active_mask_nz_cached))
+                                if num_active_nz_cached >= 2:
+                                    # Cache these for reuse in k-loop
+                                    sasic_cached = {
+                                        "active_mask_nz": active_mask_nz_cached,
+                                        "active_indices_full": np.where(active_mask_full)[0],
+                                        "active_nz_indices_full": np.where(active_mask_full & nz)[0],
+                                        "active_zero_mask": active_mask_full & ~nz,
+                                        "active_zero_indices": np.where(active_mask_full & ~nz)[0],
+                                    }
+                                else:
+                                    # Not enough active nonzero, will fallback in k-loop
+                                    sasic_active = False
+                                    active_mask_full = None
+                    
+                    # SASIC: Accumulate active input stats for this neuron (only on first pass)
+                    if sasic_layer_active and active_mask_full is not None and active_mask_full.shape[0] == len(orig_np):
+                        try:
+                            num_inputs = len(orig_np)
+                            num_active = int(np.sum(active_mask_full))
+                            active_frac = float(num_active / num_inputs) if num_inputs > 0 else 0.0
+                            sasic_layer_stats["num_inputs_list"].append(num_inputs)
+                            sasic_layer_stats["num_active_list"].append(num_active)
+                            sasic_layer_stats["active_frac_list"].append(active_frac)
+                        except Exception:
+                            # Skip logging for this neuron if anything goes wrong
+                            pass
+
+                    # Track k-trials for this neuron (for profiler stats, only if tracking enabled)
+                    k_trials_this_neuron = 0 if track_k_trials else None
+                    
+                    # SASIC k-heuristic: select k candidates (SASIC-only, strictly gated)
+                    # Baseline contract: when heuristic disabled, use full range [1, max_k]
+                    k_candidates = None
+                    k_heuristic_used = False
+                    if k_heuristic_enabled:
+                        from .sasic_utils import choose_k_candidates_heuristic
+                        k_candidates = choose_k_candidates_heuristic(
+                            max_k=max_k,
+                            mode=k_heuristic_mode,
+                            max_trials_per_neuron=k_heuristic_max_trials,
+                        )
+                        # Only use heuristic if it actually reduced the number of candidates
+                        baseline_count = max_k
+                        heuristic_count = len(k_candidates) if k_candidates else baseline_count
+                        if heuristic_count < baseline_count:
+                            k_heuristic_used = True
+                        else:
+                            # Heuristic didn't reduce candidates, use baseline range
+                            k_candidates = None
+                    
+                    # Use baseline range if heuristic not enabled or didn't reduce candidates
+                    if k_candidates is None:
+                        k_candidates = list(range(1, max_k + 1))
+                    
+                    # Timing instrumentation for SASIC profiling (if enabled)
+                    neuron_timing = None
+                    if sasic_profile_timing and sasic_active:
+                        neuron_timing = {
+                            "jenks_time": 0.0,
+                            "attachment_time": 0.0,
+                            "assignment_time": 0.0,
+                            "total_time": 0.0,
+                        }
+                        neuron_timing_start = perf_counter()
+                    
+                    for k in k_candidates:
                         if converged:
                             break
                         if progress:
@@ -249,51 +446,342 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                                 flush=True,
                             )
 
-                        breaks = _jenks_breaks(vals, k)
+                        # Count this k evaluation (only if tracking enabled)
+                        if track_k_trials:
+                            k_trials_this_neuron += 1
+                            profiler.stats["sic"]["total_k_trials"] += 1
+                        
+                        # SASIC Mode A clustering (sasic_design.md §5.1, step 3):
+                        # Run Jenks clustering on {w_i : i in A} (active inputs only)
+                        # Implementation note: we cluster active nonzero inputs, then handle
+                        # active zeros separately by assigning to nearest cluster center.
+                        # (Design doc §5.1 is flexible on active zero handling; this is our implementation choice)
+                        if sasic_active and active_mask_full is not None:
+                            # Get active mask for nonzero entries (use cached if available)
+                            if sasic_cached is not None:
+                                active_mask_nz = sasic_cached["active_mask_nz"]
+                                num_active_nz = int(np.sum(active_mask_nz))
+                            else:
+                                active_mask_nz = active_mask_full[nz]
+                                num_active_nz = int(np.sum(active_mask_nz))
+                            
+                            # Conservative check: need at least 2 active nonzero for clustering
+                            # If this fails, abort Mode A entirely for this neuron (pure baseline)
+                            # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                            if num_active_nz < 2:
+                                # Fallback: abort Mode A, use pure baseline for this neuron
+                                # This ensures no "half SASIC, half baseline" behavior
+                                sasic_active = False
+                                active_mask_full = None
+                                sasic_cached = None
+                                breaks = _jenks_breaks(vals, k)
+                            else:
+                                # Extract active nonzero values and run Jenks on active subset
+                                # (sasic_design.md §5.1, step 3: cluster weights of active inputs)
+                                vals_active = vals[active_mask_nz]
+                                jenks_start = perf_counter() if neuron_timing is not None else None
+                                breaks = _jenks_breaks(vals_active, k)
+                                if neuron_timing is not None and jenks_start is not None:
+                                    neuron_timing["jenks_time"] += perf_counter() - jenks_start
+                        else:
+                            # Baseline: run Jenks on all nonzero values (sasic_design.md §2)
+                            breaks = _jenks_breaks(vals, k)
 
                         if use_gpu:
-                            v = orig_t.clone()
-                            mask = v != 0
-                            vv = v[mask]
-                            b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
-                            bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
-                            G = b.numel() - 1
-                            means = torch.zeros(G, device=v.device, dtype=v.dtype)
-                            counts = torch.zeros_like(means)
-                            means.index_add_(0, bin_ids, vv)
-                            counts.index_add_(0, bin_ids, torch.ones_like(vv))
-                            counts = torch.where(counts == 0, torch.ones_like(counts), counts)
-                            means = means / counts
-                            vv_repl = means[bin_ids]
-                            trial_t = orig_t.clone()
-                            trial_t[mask] = vv_repl
-                            flat[idx] = trial_t
-                            row_pos: List[Tuple[torch.Tensor, float]] = []
-                            sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
-                            bin_ids_cpu = bin_ids.detach().cpu()
-                            means_cpu = means.detach().cpu()
-                            for g in range(G):
-                                g_mask = (bin_ids_cpu == g)
-                                if int(g_mask.sum().item()) == 0:
-                                    continue
-                                idxs_cpu = sel_idx[g_mask]
-                                row_pos.append((idxs_cpu, float(means_cpu[g].item())))
-                        else:
-                            new_flat = orig_np.copy()
-                            row_pos = []
-                            for i_c in range(len(breaks) - 1):
-                                lo, hi = breaks[i_c], breaks[i_c + 1]
-                                if i_c == 0:
-                                    sel = (orig_np >= lo) & (orig_np <= hi) & nz
-                                    group = vals[(vals >= lo) & (vals <= hi)]
+                            # GPU path
+                            # SASIC Mode A consolidation (sasic_design.md §5.1, steps 3-4):
+                            # - Active inputs assigned to cluster centers from Jenks
+                            # - Quiet inputs attached to nearest cluster center by weight distance
+                            if sasic_active and active_mask_full is not None:
+                                # Re-check active nonzero count (use cached if available)
+                                if sasic_cached is not None:
+                                    active_mask_nz = sasic_cached["active_mask_nz"]
+                                    num_active_nz = int(np.sum(active_mask_nz))
                                 else:
-                                    sel = (orig_np > lo) & (orig_np <= hi) & nz
-                                    group = vals[(vals > lo) & (vals <= hi)]
-                                if np.any(sel):
-                                    avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
-                                    new_flat[sel] = avg
-                                    idxs = np.where(sel)[0]
-                                    row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                                    active_mask_nz = active_mask_full[nz]
+                                    num_active_nz = int(np.sum(active_mask_nz))
+                                
+                                if num_active_nz >= 2:
+                                    # SASIC Mode A: Convert to numpy for SASIC logic, then convert back
+                                    from .sasic_utils import attach_quiet_inputs_to_clusters
+                                    # Extract active nonzero values
+                                    vals_active = vals[active_mask_nz]
+                                    
+                                    # Get indices of active nonzero inputs in the full vector (use cached if available)
+                                    if sasic_cached is not None:
+                                        active_nz_indices_full = sasic_cached["active_nz_indices_full"]
+                                        active_indices_full = sasic_cached["active_indices_full"]
+                                        active_zero_indices = sasic_cached["active_zero_indices"]
+                                    else:
+                                        active_nz_indices_full = np.where(active_mask_full & nz)[0]
+                                        active_indices_full = np.where(active_mask_full)[0]
+                                        active_zero_indices = np.where(active_mask_full & ~nz)[0]
+                                    
+                                    # Compute cluster centers and assignments for active inputs
+                                    cluster_centers = np.zeros(len(breaks) - 1)
+                                    cluster_assignments_active = np.zeros(len(vals_active), dtype=np.int32)
+                                    
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel_active = (vals_active >= lo) & (vals_active <= hi)
+                                        else:
+                                            sel_active = (vals_active > lo) & (vals_active <= hi)
+                                        
+                                        if np.any(sel_active):
+                                            group = vals_active[sel_active]
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            cluster_centers[i_c] = avg
+                                            cluster_assignments_active[sel_active] = i_c
+                                    
+                                    # Build cluster assignments for all active inputs
+                                    cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
+                                    
+                                    # Map assignments from active nonzero to active full (optimized with cached indices)
+                                    # CRITICAL FIX: Only assign clusters to active nonzero indices
+                                    # Active zeros remain zero (preserved like baseline SIC)
+                                    assignment_start = perf_counter() if neuron_timing is not None else None
+                                    if sasic_cached is not None:
+                                        # Use cached indices - create lookup dict for faster mapping
+                                        # active_indices_full is sorted, so we can use searchsorted
+                                        for i, nz_idx in enumerate(active_nz_indices_full):
+                                            pos_in_active = np.searchsorted(active_indices_full, nz_idx)
+                                            if pos_in_active < len(active_indices_full) and active_indices_full[pos_in_active] == nz_idx:
+                                                cluster_assignments_full[pos_in_active] = cluster_assignments_active[i]
+                                    else:
+                                        # Original method (slower, but preserves baseline behavior when caching disabled)
+                                        for i, nz_idx in enumerate(active_nz_indices_full):
+                                            pos = np.where(active_indices_full == nz_idx)[0]
+                                            if len(pos) > 0:
+                                                cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
+                                    
+                                    # REMOVED: Active zero assignment code
+                                    # Active zeros now remain zero (preserved like baseline SIC)
+                                    # This fixes the semantic issue where zeros were being converted to nonzero values
+                                    
+                                    if neuron_timing is not None and assignment_start is not None:
+                                        neuron_timing["assignment_time"] += perf_counter() - assignment_start
+                                    
+                                    # Build full consolidated vector using SASIC attachment
+                                    # (sasic_design.md §5.1, step 4: attach quiet inputs to nearest cluster center)
+                                    attachment_start = perf_counter() if neuron_timing is not None else None
+                                    new_flat_np = attach_quiet_inputs_to_clusters(
+                                        weights_full=orig_np,
+                                        active_mask=active_mask_full,
+                                        cluster_centers=cluster_centers,
+                                        cluster_assignments=cluster_assignments_full,
+                                        vectorized=sasic_vectorized_attachment,
+                                    )
+                                    if neuron_timing is not None and attachment_start is not None:
+                                        neuron_timing["attachment_time"] += perf_counter() - attachment_start
+                                    
+                                    # Convert back to torch tensor
+                                    trial_t = torch.from_numpy(new_flat_np).to(orig_t.device, dtype=module.weight.dtype)
+                                    flat[idx] = trial_t
+                                    
+                                    # Build row_pos for PoS
+                                    row_pos: List[Tuple[torch.Tensor, float]] = []
+                                    for i_c in range(len(breaks) - 1):
+                                        sel_mask = (cluster_assignments_active == i_c)
+                                        if np.any(sel_mask):
+                                            idxs = active_nz_indices_full[sel_mask]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
+                                else:
+                                    # Fallback: not enough active inputs, abort Mode A and use pure baseline GPU path
+                                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                                    # This ensures no "half SASIC, half baseline" behavior
+                                    sasic_active = False
+                                    active_mask_full = None
+                                    v = orig_t.clone()
+                                    mask = v != 0
+                                    vv = v[mask]
+                                    b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                                    bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
+                                    G = b.numel() - 1
+                                    means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                                    counts = torch.zeros_like(means)
+                                    means.index_add_(0, bin_ids, vv)
+                                    counts.index_add_(0, bin_ids, torch.ones_like(vv))
+                                    counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                                    means = means / counts
+                                    vv_repl = means[bin_ids]
+                                    trial_t = orig_t.clone()
+                                    trial_t[mask] = vv_repl
+                                    flat[idx] = trial_t
+                                    row_pos: List[Tuple[torch.Tensor, float]] = []
+                                    sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
+                                    bin_ids_cpu = bin_ids.detach().cpu()
+                                    means_cpu = means.detach().cpu()
+                                    for g in range(G):
+                                        g_mask = (bin_ids_cpu == g)
+                                        if int(g_mask.sum().item()) == 0:
+                                            continue
+                                        idxs_cpu = sel_idx[g_mask]
+                                        row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                            else:
+                                # Baseline GPU path
+                                v = orig_t.clone()
+                                mask = v != 0
+                                vv = v[mask]
+                                b = torch.tensor(breaks, device=v.device, dtype=v.dtype)
+                                bin_ids = torch.clamp(torch.bucketize(vv, b) - 1, 0, b.numel() - 2)
+                                G = b.numel() - 1
+                                means = torch.zeros(G, device=v.device, dtype=v.dtype)
+                                counts = torch.zeros_like(means)
+                                means.index_add_(0, bin_ids, vv)
+                                counts.index_add_(0, bin_ids, torch.ones_like(vv))
+                                counts = torch.where(counts == 0, torch.ones_like(counts), counts)
+                                means = means / counts
+                                vv_repl = means[bin_ids]
+                                trial_t = orig_t.clone()
+                                trial_t[mask] = vv_repl
+                                flat[idx] = trial_t
+                                row_pos: List[Tuple[torch.Tensor, float]] = []
+                                sel_idx = torch.nonzero(mask, as_tuple=False).view(-1).cpu()
+                                bin_ids_cpu = bin_ids.detach().cpu()
+                                means_cpu = means.detach().cpu()
+                                for g in range(G):
+                                    g_mask = (bin_ids_cpu == g)
+                                    if int(g_mask.sum().item()) == 0:
+                                        continue
+                                    idxs_cpu = sel_idx[g_mask]
+                                    row_pos.append((idxs_cpu, float(means_cpu[g].item())))
+                        else:
+                            # CPU path
+                            # SASIC Mode A consolidation (sasic_design.md §5.1, steps 3-4)
+                            if sasic_active and active_mask_full is not None:
+                                # Re-check active nonzero count (use cached if available)
+                                if sasic_cached is not None:
+                                    active_mask_nz = sasic_cached["active_mask_nz"]
+                                    num_active_nz = int(np.sum(active_mask_nz))
+                                else:
+                                    active_mask_nz = active_mask_full[nz]
+                                    num_active_nz = int(np.sum(active_mask_nz))
+                                
+                                if num_active_nz >= 2:
+                                    # SASIC Mode A: Cluster active inputs, attach quiet inputs
+                                    from .sasic_utils import attach_quiet_inputs_to_clusters
+                                    # Extract active nonzero values
+                                    vals_active = vals[active_mask_nz]
+                                    
+                                    # Get indices of active nonzero inputs in the full vector (use cached if available)
+                                    if sasic_cached is not None:
+                                        active_nz_indices_full = sasic_cached["active_nz_indices_full"]
+                                        active_indices_full = sasic_cached["active_indices_full"]
+                                        active_zero_indices = sasic_cached["active_zero_indices"]
+                                    else:
+                                        active_nz_indices_full = np.where(active_mask_full & nz)[0]
+                                        active_indices_full = np.where(active_mask_full)[0]
+                                        active_zero_indices = np.where(active_mask_full & ~nz)[0]
+                                    
+                                    # Compute cluster centers and assignments for active inputs
+                                    cluster_centers = np.zeros(len(breaks) - 1)
+                                    cluster_assignments_active = np.zeros(len(vals_active), dtype=np.int32)
+                                    
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel_active = (vals_active >= lo) & (vals_active <= hi)
+                                        else:
+                                            sel_active = (vals_active > lo) & (vals_active <= hi)
+                                        
+                                        if np.any(sel_active):
+                                            group = vals_active[sel_active]
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            cluster_centers[i_c] = avg
+                                            cluster_assignments_active[sel_active] = i_c
+                                    
+                                    # Build cluster assignments for all active inputs (nonzero only, since we clustered nonzero)
+                                    # active_nz_indices_full contains the full vector indices of active nonzero inputs
+                                    # cluster_assignments_active[i] is the cluster for the i-th active nonzero value
+                                    # We need cluster_assignments_full where cluster_assignments_full[j] is the cluster
+                                    # for the j-th active input in the full vector
+                                    
+                                    cluster_assignments_full = np.zeros(len(active_indices_full), dtype=np.int32)
+                                    
+                                    # Create mapping: for each active nonzero input, find its position in active_indices_full
+                                    # CRITICAL FIX: Only assign clusters to active nonzero indices
+                                    # Active zeros remain zero (preserved like baseline SIC)
+                                    assignment_start = perf_counter() if neuron_timing is not None else None
+                                    if sasic_cached is not None:
+                                        # Use cached indices - active_indices_full is sorted, so we can use searchsorted
+                                        for i, nz_idx in enumerate(active_nz_indices_full):
+                                            pos_in_active = np.searchsorted(active_indices_full, nz_idx)
+                                            if pos_in_active < len(active_indices_full) and active_indices_full[pos_in_active] == nz_idx:
+                                                cluster_assignments_full[pos_in_active] = cluster_assignments_active[i]
+                                    else:
+                                        # Original method (slower, but preserves baseline behavior when caching disabled)
+                                        for i, nz_idx in enumerate(active_nz_indices_full):
+                                            pos = np.where(active_indices_full == nz_idx)[0]
+                                            if len(pos) > 0:
+                                                cluster_assignments_full[pos[0]] = cluster_assignments_active[i]
+                                    
+                                    # REMOVED: Active zero assignment code
+                                    # Active zeros now remain zero (preserved like baseline SIC)
+                                    # This fixes the semantic issue where zeros were being converted to nonzero values
+                                    
+                                    if neuron_timing is not None and assignment_start is not None:
+                                        neuron_timing["assignment_time"] += perf_counter() - assignment_start
+                                    
+                                    # Build full consolidated vector using SASIC attachment
+                                    # (sasic_design.md §5.1, step 4: attach quiet inputs to nearest cluster center)
+                                    attachment_start = perf_counter() if neuron_timing is not None else None
+                                    new_flat = attach_quiet_inputs_to_clusters(
+                                        weights_full=orig_np,
+                                        active_mask=active_mask_full,
+                                        cluster_centers=cluster_centers,
+                                        cluster_assignments=cluster_assignments_full,
+                                        vectorized=sasic_vectorized_attachment,
+                                    )
+                                    if neuron_timing is not None and attachment_start is not None:
+                                        neuron_timing["attachment_time"] += perf_counter() - attachment_start
+                                    
+                                    # Build row_pos for PoS (only active inputs that were clustered)
+                                    row_pos = []
+                                    for i_c in range(len(breaks) - 1):
+                                        sel_mask = (cluster_assignments_active == i_c)
+                                        if np.any(sel_mask):
+                                            idxs = active_nz_indices_full[sel_mask]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(cluster_centers[i_c])))
+                                else:
+                                    # Fallback: not enough active inputs, abort Mode A and use pure baseline
+                                    # (sasic_design.md §10: must preserve baseline behavior when disabled)
+                                    # This ensures no "half SASIC, half baseline" behavior
+                                    sasic_active = False
+                                    active_mask_full = None
+                                    new_flat = orig_np.copy()
+                                    row_pos = []
+                                    for i_c in range(len(breaks) - 1):
+                                        lo, hi = breaks[i_c], breaks[i_c + 1]
+                                        if i_c == 0:
+                                            sel = (orig_np >= lo) & (orig_np <= hi) & nz
+                                            group = vals[(vals >= lo) & (vals <= hi)]
+                                        else:
+                                            sel = (orig_np > lo) & (orig_np <= hi) & nz
+                                            group = vals[(vals > lo) & (vals <= hi)]
+                                        if np.any(sel):
+                                            avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                            new_flat[sel] = avg
+                                            idxs = np.where(sel)[0]
+                                            row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            else:
+                                # Baseline: standard consolidation
+                                new_flat = orig_np.copy()
+                                row_pos = []
+                                for i_c in range(len(breaks) - 1):
+                                    lo, hi = breaks[i_c], breaks[i_c + 1]
+                                    if i_c == 0:
+                                        sel = (orig_np >= lo) & (orig_np <= hi) & nz
+                                        group = vals[(vals >= lo) & (vals <= hi)]
+                                    else:
+                                        sel = (orig_np > lo) & (orig_np <= hi) & nz
+                                        group = vals[(vals > lo) & (vals <= hi)]
+                                    if np.any(sel):
+                                        avg = float(np.mean(group)) if group.size else float((lo + hi) / 2)
+                                        new_flat[sel] = avg
+                                        idxs = np.where(sel)[0]
+                                        row_pos.append((torch.tensor(idxs, dtype=torch.long), float(avg)))
+                            
                             trial_t = torch.from_numpy(new_flat).to(orig_t.device, dtype=module.weight.dtype)
                             flat[idx] = trial_t
 
@@ -316,11 +804,109 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     if not converged:
                         profiler.record_neuron_attempt(name, idx, max_k, False, "max_clusters_exceeded")
                         no_change[idx] = no_change[idx] + 1
+                    
+                    # Record neuron timing breakdown (if profiling enabled)
+                    if neuron_timing is not None:
+                        neuron_timing["total_time"] = perf_counter() - neuron_timing_start
+                        profiler.record_neuron_timing(name, idx, neuron_timing)
+                    
+                    # Record k-trials for this neuron (only if tracking enabled)
+                    if track_k_trials:
+                        # Track both per-layer and global totals
+                        # Per-layer stats use profiler.stats["layers"] schema (consistent with existing profiler)
+                        if name not in profiler.stats["layers"]:
+                            profiler.stats["layers"][name] = {}
+                        layer_stats = profiler.stats["layers"][name]
+                        if "k_trials_list" not in layer_stats:
+                            layer_stats["k_trials_list"] = []
+                        layer_stats["k_trials_list"].append(k_trials_this_neuron)
+                        
+                        # Increment neuron counter once per neuron (after k-loop finishes)
+                        profiler.stats["sic"]["num_neurons_evaluated"] += 1
+                    
+                    # Record k-heuristic stats (SASIC-only, strictly gated)
+                    if k_heuristic_enabled and k_heuristic_used:
+                        # Initialize SASIC k-heuristic stats structure if needed
+                        profiler.stats.setdefault("sasic", {}).setdefault("k_heuristic", {})
+                        k_heuristic_stats = profiler.stats["sasic"]["k_heuristic"]
+                        
+                        # Initialize per-layer stats if needed
+                        if "layers" not in k_heuristic_stats:
+                            k_heuristic_stats["layers"] = {}
+                        if name not in k_heuristic_stats["layers"]:
+                            k_heuristic_stats["layers"][name] = {
+                                "neurons_with_heuristic": 0,
+                                "total_trials_saved": 0,
+                                "chosen_k_list": [],
+                            }
+                        
+                        layer_heuristic_stats = k_heuristic_stats["layers"][name]
+                        
+                        # Record that this neuron used the heuristic
+                        layer_heuristic_stats["neurons_with_heuristic"] += 1
+                        
+                        # Calculate trials saved (baseline would try max_k, heuristic tried len(k_candidates))
+                        baseline_trials = max_k
+                        heuristic_trials = len(k_candidates) if k_candidates else baseline_trials
+                        trials_saved = max(0, baseline_trials - heuristic_trials)
+                        layer_heuristic_stats["total_trials_saved"] += trials_saved
+                        
+                        # Record chosen k (the k value that was accepted, or max_k if none accepted)
+                        chosen_k = max_k if not converged else k
+                        layer_heuristic_stats["chosen_k_list"].append(chosen_k)
 
                 with torch.no_grad():
                     module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
                 setattr(module, "_sic_pos_clusters", pos_clusters_for_layer)
                 setattr(module, "_sic_no_change", no_change)
+                
+                # Record weight distribution after SIC (for regular layers) - gated bugfix
+                if record_after_weights and pass_idx == max_passes - 1 and name in initial_layer_flats:
+                    after_flat_cpu = _flatten_weight(module.weight).detach().cpu().numpy()
+                    profiler.record_weight_distribution(name, initial_layer_flats[name], after_flat_cpu)
+                
+                # SASIC: Store per-layer active input stats in profiler (only on first pass)
+                if sasic_layer_active and sasic_layer_stats is not None:
+                    try:
+                        if sasic_layer_stats["num_inputs_list"]:
+                            from .sasic_utils import get_layer_key_for_sasic
+                            layer_key = get_layer_key_for_sasic(name, module)
+                            num_inputs = sasic_layer_stats["num_inputs_list"][0]  # Should be same for all neurons
+                            avg_active = float(np.mean(sasic_layer_stats["num_active_list"]))
+                            avg_active_frac = float(np.mean(sasic_layer_stats["active_frac_list"]))
+                            
+                            profiler.stats.setdefault("sasic", {}).setdefault("layers", {})[layer_key] = {
+                                "num_inputs": int(num_inputs),
+                                "avg_active": avg_active,
+                                "avg_active_frac": avg_active_frac,
+                            }
+                    except Exception:
+                        # Skip logging for this layer if anything goes wrong
+                        pass
+                
+                # Compute per-layer k-trials statistics (only if tracking enabled)
+                if track_k_trials and name in profiler.stats["layers"]:
+                    layer_stats = profiler.stats["layers"][name]
+                    if "k_trials_list" in layer_stats and layer_stats["k_trials_list"]:
+                        k_trials_list = layer_stats["k_trials_list"]
+                        layer_stats["avg_k_trials_per_neuron"] = float(np.mean(k_trials_list))
+                        layer_stats["total_k_trials"] = int(sum(k_trials_list))
+                        # Keep list for detailed analysis, but also store aggregate
+                
+                # Compute aggregate k-heuristic statistics for this layer (SASIC-only)
+                if k_heuristic_enabled and "sasic" in profiler.stats and "k_heuristic" in profiler.stats["sasic"]:
+                    k_heuristic_stats = profiler.stats["sasic"]["k_heuristic"]
+                    if "layers" in k_heuristic_stats and name in k_heuristic_stats["layers"]:
+                        layer_heuristic_stats = k_heuristic_stats["layers"][name]
+                        if "chosen_k_list" in layer_heuristic_stats and layer_heuristic_stats["chosen_k_list"]:
+                            chosen_k_list = layer_heuristic_stats["chosen_k_list"]
+                            layer_heuristic_stats["avg_chosen_k"] = float(np.mean(chosen_k_list))
+                            layer_heuristic_stats["min_chosen_k"] = int(min(chosen_k_list))
+                            layer_heuristic_stats["max_chosen_k"] = int(max(chosen_k_list))
+                            # Compute distribution (count of each chosen k value)
+                            chosen_k_dist = Counter(chosen_k_list)
+                            layer_heuristic_stats["chosen_k_distribution"] = {int(k): int(v) for k, v in chosen_k_dist.items()}
+                
                 if autosave_each and autosave_path:
                     profiler.save_detailed_stats(autosave_path)
                 profiler.record_layer_processing(name, perf_counter() - layer_t0, success_count_this_layer, num_neurons)
@@ -546,6 +1132,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                             if int(idxs.sum().item()) > 1:
                                 row[idxs] = row[idxs].mean()
                                 merges += 1
+                    # Write back merged weights to actual model parameter tensor
                     module.weight.copy_(flat_t.view_as(w) if w.ndim > 2 else flat_t)
             for name, module in model.named_modules():
                 if not _is_indexed_sparse_linear(module):
@@ -569,6 +1156,28 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
         profiler.stats["phases"]["merging"]["merges_performed"] = merges
         profiler.end_phase("merging")
 
+    # Compute final global stats after all SIC operations
+    profiler.stats["global"]["final_params"] = sum(p.numel() for p in model.parameters())
+    original_params = profiler.stats["global"].get("original_params", 0)
+    final_params = profiler.stats["global"]["final_params"]
+    if original_params > 0:
+        profiler.stats["global"]["compression_ratio"] = float(original_params / max(1, final_params))
+    
+    # Compute effective_params (unique nonzero weights after rounding)
+    effective_params = 0
+    zero_params = 0
+    for p in model.parameters():
+        if p.numel() > 0:
+            p_flat = p.detach().cpu().numpy().flatten()
+            zero_params += int(np.sum(p_flat == 0))
+            # Count unique nonzero values after rounding
+            p_nz = p_flat[p_flat != 0]
+            if p_nz.size > 0:
+                p_rounded = np.round(p_nz, decimals=rounding_decimals)
+                effective_params += int(np.unique(p_rounded).size)
+    profiler.stats["global"]["effective_params"] = effective_params
+    profiler.stats["global"]["zero_params"] = zero_params
+    
     profiler.start_phase("verification")
     profiler.end_phase("verification")
     profiler.end_profiling()
@@ -576,9 +1185,9 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     return model, profiler.stats
 
 @torch.inference_mode()
-def SIC_hybrid(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
-    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="hybrid")
+def SIC_hybrid(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None, calibration_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="hybrid", calibration_loader=calibration_loader)
 
 @torch.inference_mode()
-def SIC(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None):
-    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="classic")
+def SIC(model: nn.Module, train_loader, device: torch.device, visualize: bool = False, profiler: Optional[SICProfiler] = None, cfg: Optional[Dict[str, Any]] = None, val_loader=None, calibration_loader=None):
+    return _sic_core(model, train_loader, device, visualize, profiler, cfg, val_loader, mode="classic", calibration_loader=calibration_loader)

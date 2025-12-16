@@ -16,4 +16,6 @@ SIC/saved_models/
 
 # Generated docs / tests (if not source)
 SIC/docs/
-SIC/tests/
+
+# OS
+.DS_Store

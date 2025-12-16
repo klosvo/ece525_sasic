@@ -6,6 +6,7 @@ import torch
 import pandas as pd
 import dill
 import importlib.util
+from datetime import datetime
 from torch.utils.data import DataLoader
 from typing import Dict, Any, Tuple
 
@@ -143,6 +144,31 @@ def main():
         worker_init_fn=worker_init_fn,
     )
 
+    # Build calibration loader for SASIC if enabled
+    # TODO: Enforce strict class-balance in calibration slice (sasic_design.md §4.1).
+    #       Currently uses random subset via calibration_fraction. Future improvement:
+    #       sample equal number of examples per class (e.g., 50-100 per class, capped).
+    calibration_loader = None
+    sasic_cfg = cfg.get("sasic", {}) or {}
+    if sasic_cfg.get("enabled", False) and sasic_cfg.get("mode") == "active":
+        calibration_fraction = float(sasic_cfg.get("calibration_fraction", 0.1))
+        if calibration_fraction > 0:
+            from torch.utils.data import Subset
+            # Create calibration subset from training data
+            calib_size = max(1, int(len(train_ds) * calibration_fraction))
+            # Use a fixed seed for reproducibility
+            calib_indices = torch.randperm(len(train_ds), generator=torch.Generator().manual_seed(seed))[:calib_size].tolist()
+            calib_subset = Subset(train_ds, calib_indices)
+            calibration_loader = DataLoader(
+                calib_subset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent,
+                worker_init_fn=worker_init_fn,
+            )
+
     device_eval, eval_test_loader = _make_clean_eval_loader(cfg)
 
     obj_path = io.get("custom_model_object_path")
@@ -170,34 +196,115 @@ def main():
 
     if weights_path_cfg:
         base_model_name = os.path.basename(resolve_in_dir(weights_path_cfg, models_dir))
-    save_path = (
-        resolve_in_dir(io.get("custom_save_name"), models_dir)
-        if io.get("custom_save_name")
-        else os.path.join(models_dir, f"SIC_{base_model_name}")
-    )
-
-    sic_base = os.path.splitext(os.path.basename(save_path))[0]
-    excel_path = build_output_path(io.get("excel_path"), profiling_dir, f"{sic_base}.xlsx")
+    
+    # Derive config_tag from config_name
+    config_name = cfg.get("config_name", "unknown_config.yaml")
+    if config_name == "sic.yaml":
+        config_tag = "main"
+    elif config_name == "sic_dev.yaml":
+        config_tag = "dev"
+    elif config_name == "sic_smoke.yaml":
+        config_tag = "smoke"
+    else:
+        config_tag = "other"
+    
+    # Update output directories to include config_tag
+    models_dir = os.path.join(models_dir, config_tag)
+    profiling_dir = os.path.join(profiling_dir, config_tag)
+    cfg["io"]["models_dir"] = models_dir
+    cfg["io"]["profiling_dir"] = profiling_dir
+    ensure_parent_dir(models_dir + "/")
+    ensure_parent_dir(profiling_dir + "/")
+    
+    # Construct human-readable timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
+    
+    # Determine run mode label
+    sasic_cfg = cfg.get("sasic", {}) or {}
+    sasic_enabled = sasic_cfg.get("enabled", False)
+    sasic_mode = sasic_cfg.get("mode", "none")
+    
+    if not sasic_enabled or sasic_mode == "none":
+        run_mode_label = "baseline"
+    elif sasic_enabled and sasic_mode == "active":
+        run_mode_label = "SASIC"
+    elif sasic_mode == "weighted":
+        run_mode_label = "SASIC_Weighted"
+    elif sasic_mode == "hybrid":
+        run_mode_label = "SASIC_Hybrid"
+    else:
+        raise ValueError(
+            f"Invalid SASIC configuration: enabled={sasic_enabled}, mode={sasic_mode}. "
+            f"Mode must be one of: 'none', 'active', 'weighted', 'hybrid'"
+        )
+    
+    # Build unified run prefix
+    model_name = cfg.get("model", "UnknownModel")
+    dataset_name = cfg.get("dataset", "UnknownDataset")
+    run_prefix = f"{model_name}_{dataset_name}_{run_mode_label}_{timestamp}"
+    
+    # Build model weights filename (support custom_save_name)
+    custom_save_name = io.get("custom_save_name")
+    if custom_save_name:
+        base, ext = os.path.splitext(os.path.basename(custom_save_name))
+        if not ext:
+            ext = ".pth"
+        save_filename = f"{base}_{timestamp}{ext}"
+    else:
+        save_filename = f"{run_prefix}.pth"
+    
+    save_path = os.path.join(models_dir, save_filename)
+    
     enable_json = bool(io.get("enable_json_stats", True))
     enable_log = bool(io.get("enable_neuron_log", True))
     enable_auto = bool(io.get("enable_autosave_progress", True))
+    
     json_path = (
-        build_output_path(io.get("json_stats_path"), profiling_dir, f"{sic_base}_detailed_stats.json")
+        build_output_path(
+            io.get("json_stats_path"),
+            profiling_dir,
+            f"{run_prefix}_stats.json",
+        )
         if enable_json
         else None
     )
-    neuron_log_path = build_output_path(
-        io.get("neuron_log_path", os.path.join(profiling_dir, "SIC_per_neuron_times.jsonl")),
-        profiling_dir,
-        "SIC_per_neuron_times.jsonl",
-    ) if enable_log else None
-    autosave_progress_path = build_output_path(
-        io.get("autosave_progress_path", os.path.join(profiling_dir, "SIC_Progress_Autosave.json")),
-        profiling_dir,
-        "SIC_Progress_Autosave.json",
-    ) if enable_auto else None
+    
+    neuron_log_path = (
+        build_output_path(
+            io.get("neuron_log_path", os.path.join(profiling_dir, "SIC_per_neuron_times.jsonl")),
+            profiling_dir,
+            f"{run_prefix}_neurons.jsonl",
+        )
+        if enable_log
+        else None
+    )
+    
+    autosave_progress_path = (
+        build_output_path(
+            io.get("autosave_progress_path", os.path.join(profiling_dir, "SIC_Progress_Autosave.json")),
+            profiling_dir,
+            f"{run_prefix}_progress.json",
+        )
+        if enable_auto
+        else None
+    )
+    
+    excel_path = build_output_path(io.get("excel_path"), profiling_dir, f"{run_prefix}.xlsx")
+    
     cfg["io"]["neuron_log_path"] = neuron_log_path
     cfg["io"]["autosave_progress_path"] = autosave_progress_path
+    
+    # Print run_prefix and resulting filenames
+    print(f"\n[RUN] Run prefix: {run_prefix}")
+    print(f"[RUN] Model weights: {save_path}")
+    if json_path:
+        print(f"[RUN] JSON stats: {json_path}")
+    if neuron_log_path:
+        print(f"[RUN] Neuron logs: {neuron_log_path}")
+    if autosave_progress_path:
+        print(f"[RUN] Autosave progress: {autosave_progress_path}")
+    if bool(cfg["io"].get("write_full_weights_to_excel", False)):
+        print(f"[RUN] Excel report: {excel_path}")
 
     print("\nINITIAL MODEL ANALYSIS")
     pre_profiler = SICProfiler()
@@ -238,6 +345,7 @@ def main():
             profiler=sic_profiler,
             cfg=cfg,
             val_loader=val_loader,
+            calibration_loader=calibration_loader,
         )
     else:
         model, _ = SIC(
@@ -248,10 +356,23 @@ def main():
             profiler=sic_profiler,
             cfg=cfg,
             val_loader=val_loader,
+            calibration_loader=calibration_loader,
         )
 
     changed_by_sic = _fingerprint(model) != fp_before
     print(f"[SIC] Model changed: {changed_by_sic}")
+    
+    # Optional post-run verification: check that reported SIC activity matches weight changes
+    # (Only runs if sic.verify_post_run is enabled - not part of baseline)
+    if bool(sic.get("verify_post_run", False)):
+        import warnings
+        merges = sic_profiler.stats.get("phases", {}).get("merging", {}).get("merges_performed", 0)
+        successful_neurons = sic_profiler.stats.get("phases", {}).get("clustering", {}).get("successful_neurons", 0)
+        if (merges > 0 or successful_neurons > 0) and not changed_by_sic:
+            warnings.warn(
+                f"SIC reported activity (merges={merges}, successful_neurons={successful_neurons}) "
+                f"but model fingerprint unchanged. This may indicate weights were not applied."
+            )
 
     print("\nPRE-PRUNE ACCURACY")
     preprune_test_acc = float(evaluate(model.to(device_eval).eval(), eval_test_loader, device_eval))
@@ -303,7 +424,7 @@ def main():
 
     ensure_parent_dir(save_path)
     torch.save(model.state_dict(), save_path)
-    print(f"[SIC] Weights saved: {save_path}")
+    print(f"[SIC] Model weights saved: {save_path}")
 
     print("\nFINAL MODEL ANALYSIS")
     final_profiler = SICProfiler()
@@ -322,19 +443,27 @@ def main():
         final_val_acc = float(evaluate(model.to(device_eval).eval(), val_loader, device_eval))
         print(f"[EVAL] Val  (final): {final_val_acc:.2f}%")
 
+    # Merge final verification stats into the SIC run profiler
+    # (The SIC profiler already has end_profiling() called and derived stats computed)
+    if "verification" in final_profiler.stats:
+        sic_profiler.stats["verification"] = final_profiler.stats["verification"]
+
     if json_path:
-        final_profiler.save_detailed_stats(json_path)
+        ensure_parent_dir(json_path)
+        # Save the SIC profiler (not final_profiler) - it contains all clustering/phases/layers stats
+        sic_profiler.save_detailed_stats(json_path)
+        print(f"[SIC] Profiler JSON saved: {json_path}")
 
     if bool(cfg["io"].get("write_full_weights_to_excel", False)):
         ensure_parent_dir(excel_path)
         global_df = pd.DataFrame(
             [
                 {
-                    "start_time": final_profiler.stats["global"].get("start_time"),
-                    "end_time": final_profiler.stats["global"].get("end_time"),
-                    "total_duration_sec": final_profiler.stats["global"].get("total_duration", 0.0),
-                    "memory_peak_mb": final_profiler.stats["global"].get("memory_peak_mb", 0.0),
-                    "memory_saved_mb": final_profiler.stats["global"].get("memory_saved_mb", 0.0),
+                    "start_time": sic_profiler.stats["global"].get("start_time"),
+                    "end_time": sic_profiler.stats["global"].get("end_time"),
+                    "total_duration_sec": sic_profiler.stats["global"].get("total_duration", 0.0),
+                    "memory_peak_mb": sic_profiler.stats["global"].get("memory_peak_mb", 0.0),
+                    "memory_saved_mb": sic_profiler.stats["global"].get("memory_saved_mb", 0.0),
                 }
             ]
         )
