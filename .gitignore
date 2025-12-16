@@ -1,0 +1,19 @@
+# Editors / tools
+.cursor/
+.devtools/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data / experiments
+data/
+profiling/
+
+# Models / checkpoints
+saved_models/
+SIC/saved_models/
+
+# Generated docs / tests (if not source)
+SIC/docs/
+SIC/tests/
