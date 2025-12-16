@@ -259,11 +259,11 @@ def generate_console_summary(data: Dict[str, Any]) -> str:
     # Weirdness flags
     warnings = check_weirdness_flags(data)
     if warnings:
-        lines.append(f"\n⚠️  Anomalies/Warnings:")
+        lines.append(f"\nAnomalies/Warnings:")
         for flag_name, message in warnings:
             lines.append(f"  [{flag_name}] {message}")
     else:
-        lines.append(f"\n✓ No anomalies detected")
+        lines.append(f"\nNo anomalies detected")
     
     lines.append("\n" + "=" * 80)
     return "\n".join(lines)
@@ -397,7 +397,7 @@ def generate_markdown_summary(data: Dict[str, Any]) -> str:
     # Weirdness flags
     warnings = check_weirdness_flags(data)
     if warnings:
-        lines.append("## ⚠️ Anomalies and Warnings")
+        lines.append("## Anomalies and Warnings")
         lines.append("")
         for flag_name, message in warnings:
             lines.append(f"### [{flag_name}]")
@@ -405,7 +405,7 @@ def generate_markdown_summary(data: Dict[str, Any]) -> str:
             lines.append(f"{message}")
             lines.append("")
     else:
-        lines.append("## ✓ Status")
+        lines.append("## Status")
         lines.append("")
         lines.append("No anomalies detected.")
         lines.append("")

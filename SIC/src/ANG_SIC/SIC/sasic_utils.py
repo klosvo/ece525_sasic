@@ -219,3 +219,65 @@ def attach_quiet_inputs_to_clusters(
             consolidated[input_idx] = cluster_centers[nearest_cluster]
     
     return consolidated
+
+
+def choose_k_candidates_heuristic(
+    max_k: int,
+    mode: str,
+    max_trials_per_neuron: Optional[int] = None,
+) -> list[int]:
+    """
+    Choose k candidates for clustering based on heuristic mode.
+    
+    This is a SASIC-only optimization that reduces the number of k values
+    evaluated per neuron, reducing runtime while preserving acceptance semantics.
+    
+    Args:
+        max_k: Maximum k value that would be tried in baseline (from uniq_nz - 1, clamped by max_k_per_neuron).
+        mode: Heuristic mode. Currently supports:
+            - "budgeted_sweep": Evenly spaced k values up to max_trials_per_neuron
+        max_trials_per_neuron: Maximum number of k values to try (budget).
+            If None or >= max_k, returns full range [1, max_k] (no reduction).
+    
+    Returns:
+        Sorted list of k values to try (integers from 1 to max_k, inclusive).
+        Always includes k=1 (minimum) and k=max_k (maximum) if max_k >= 1.
+        When heuristic is disabled or budget >= max_k, returns [1, 2, ..., max_k].
+    
+    Note:
+        This function does NOT change acceptance semantics. It only reduces
+        the candidate k values considered. The acceptance logic remains unchanged.
+    """
+    if max_k < 1:
+        return []
+    
+    # If no budget or budget >= max_k, return full range (no reduction)
+    if max_trials_per_neuron is None or max_trials_per_neuron >= max_k:
+        return list(range(1, max_k + 1))
+    
+    if mode == "budgeted_sweep":
+        # Evenly spaced k values, always including k=1 and k=max_k
+        if max_trials_per_neuron <= 2:
+            # Minimum: try k=1 and k=max_k
+            if max_k == 1:
+                return [1]
+            return [1, max_k]
+        
+        # Generate evenly spaced k values
+        # Use numpy linspace to get evenly spaced indices, then round to integers
+        k_indices = np.linspace(0, max_k - 1, num=max_trials_per_neuron, dtype=int)
+        k_values = [int(k_idx + 1) for k_idx in k_indices]  # Convert to 1-indexed k values
+        
+        # Ensure k=1 and k=max_k are included
+        k_set = set(k_values)
+        k_set.add(1)
+        k_set.add(max_k)
+        k_values = sorted(list(k_set))
+        
+        # Clamp to valid range [1, max_k]
+        k_values = [k for k in k_values if 1 <= k <= max_k]
+        
+        return k_values
+    else:
+        # Unknown mode: fallback to full range
+        return list(range(1, max_k + 1))

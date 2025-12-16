@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Union, List, Dict, Any
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -107,6 +108,18 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
     sasic_cache_indices = bool(sasic_cfg.get("cache_indices", False))
     sasic_vectorized_attachment = bool(sasic_cfg.get("vectorized_attachment", False))
     sasic_profile_timing = bool(sasic_cfg.get("profile_timing", False))
+    
+    # SASIC k-heuristic (SASIC-only, default OFF to preserve baseline contract)
+    k_heuristic_cfg = sasic_cfg.get("k_heuristic", {}) or {}
+    k_heuristic_enabled = (
+        bool(sasic_cfg.get("enabled", False))
+        and sasic_cfg.get("mode") != "none"
+        and bool(k_heuristic_cfg.get("enabled", False))
+    )
+    k_heuristic_mode = str(k_heuristic_cfg.get("mode", "budgeted_sweep"))
+    k_heuristic_max_trials = k_heuristic_cfg.get("max_trials_per_neuron", None)
+    if k_heuristic_max_trials is not None:
+        k_heuristic_max_trials = int(k_heuristic_max_trials)
 
     if bool(sic_cfg.get("compile_model", False)) and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -388,6 +401,30 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                     # Track k-trials for this neuron (for profiler stats, only if tracking enabled)
                     k_trials_this_neuron = 0 if track_k_trials else None
                     
+                    # SASIC k-heuristic: select k candidates (SASIC-only, strictly gated)
+                    # Baseline contract: when heuristic disabled, use full range [1, max_k]
+                    k_candidates = None
+                    k_heuristic_used = False
+                    if k_heuristic_enabled:
+                        from .sasic_utils import choose_k_candidates_heuristic
+                        k_candidates = choose_k_candidates_heuristic(
+                            max_k=max_k,
+                            mode=k_heuristic_mode,
+                            max_trials_per_neuron=k_heuristic_max_trials,
+                        )
+                        # Only use heuristic if it actually reduced the number of candidates
+                        baseline_count = max_k
+                        heuristic_count = len(k_candidates) if k_candidates else baseline_count
+                        if heuristic_count < baseline_count:
+                            k_heuristic_used = True
+                        else:
+                            # Heuristic didn't reduce candidates, use baseline range
+                            k_candidates = None
+                    
+                    # Use baseline range if heuristic not enabled or didn't reduce candidates
+                    if k_candidates is None:
+                        k_candidates = list(range(1, max_k + 1))
+                    
                     # Timing instrumentation for SASIC profiling (if enabled)
                     neuron_timing = None
                     if sasic_profile_timing and sasic_active:
@@ -399,7 +436,7 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         }
                         neuron_timing_start = perf_counter()
                     
-                    for k in range(1, max_k + 1):
+                    for k in k_candidates:
                         if converged:
                             break
                         if progress:
@@ -786,6 +823,37 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         
                         # Increment neuron counter once per neuron (after k-loop finishes)
                         profiler.stats["sic"]["num_neurons_evaluated"] += 1
+                    
+                    # Record k-heuristic stats (SASIC-only, strictly gated)
+                    if k_heuristic_enabled and k_heuristic_used:
+                        # Initialize SASIC k-heuristic stats structure if needed
+                        profiler.stats.setdefault("sasic", {}).setdefault("k_heuristic", {})
+                        k_heuristic_stats = profiler.stats["sasic"]["k_heuristic"]
+                        
+                        # Initialize per-layer stats if needed
+                        if "layers" not in k_heuristic_stats:
+                            k_heuristic_stats["layers"] = {}
+                        if name not in k_heuristic_stats["layers"]:
+                            k_heuristic_stats["layers"][name] = {
+                                "neurons_with_heuristic": 0,
+                                "total_trials_saved": 0,
+                                "chosen_k_list": [],
+                            }
+                        
+                        layer_heuristic_stats = k_heuristic_stats["layers"][name]
+                        
+                        # Record that this neuron used the heuristic
+                        layer_heuristic_stats["neurons_with_heuristic"] += 1
+                        
+                        # Calculate trials saved (baseline would try max_k, heuristic tried len(k_candidates))
+                        baseline_trials = max_k
+                        heuristic_trials = len(k_candidates) if k_candidates else baseline_trials
+                        trials_saved = max(0, baseline_trials - heuristic_trials)
+                        layer_heuristic_stats["total_trials_saved"] += trials_saved
+                        
+                        # Record chosen k (the k value that was accepted, or max_k if none accepted)
+                        chosen_k = max_k if not converged else k
+                        layer_heuristic_stats["chosen_k_list"].append(chosen_k)
 
                 with torch.no_grad():
                     module.weight.copy_(best_flat.view_as(w) if w.ndim > 2 else best_flat)
@@ -824,6 +892,20 @@ def _sic_core(model: nn.Module, train_loader, device: torch.device, visualize: b
                         layer_stats["avg_k_trials_per_neuron"] = float(np.mean(k_trials_list))
                         layer_stats["total_k_trials"] = int(sum(k_trials_list))
                         # Keep list for detailed analysis, but also store aggregate
+                
+                # Compute aggregate k-heuristic statistics for this layer (SASIC-only)
+                if k_heuristic_enabled and "sasic" in profiler.stats and "k_heuristic" in profiler.stats["sasic"]:
+                    k_heuristic_stats = profiler.stats["sasic"]["k_heuristic"]
+                    if "layers" in k_heuristic_stats and name in k_heuristic_stats["layers"]:
+                        layer_heuristic_stats = k_heuristic_stats["layers"][name]
+                        if "chosen_k_list" in layer_heuristic_stats and layer_heuristic_stats["chosen_k_list"]:
+                            chosen_k_list = layer_heuristic_stats["chosen_k_list"]
+                            layer_heuristic_stats["avg_chosen_k"] = float(np.mean(chosen_k_list))
+                            layer_heuristic_stats["min_chosen_k"] = int(min(chosen_k_list))
+                            layer_heuristic_stats["max_chosen_k"] = int(max(chosen_k_list))
+                            # Compute distribution (count of each chosen k value)
+                            chosen_k_dist = Counter(chosen_k_list)
+                            layer_heuristic_stats["chosen_k_distribution"] = {int(k): int(v) for k, v in chosen_k_dist.items()}
                 
                 if autosave_each and autosave_path:
                     profiler.save_detailed_stats(autosave_path)
